@@ -1,0 +1,6 @@
+node_modules/
+playwright-profile*/
+npm-debug.log
+proxy-*.log
+.env
+.git

@@ -188,12 +188,45 @@ E defina como padrão no `~/.pi/agent/settings.json`:
 5. A resposta SSE é convertida de volta para o formato OpenAI
 6. O campo `chat_template_kwargs.thinking` é sempre definido como `false` (a menos que `NVIDIA_THINKING=true`)
 
+## Docker
+
+### Construir e executar
+
+```bash
+# Construir a imagem
+docker build -t nvidia-kimi-proxy .
+
+# Executar o container
+docker run -d \
+  --name nvidia-kimi-proxy \
+  -p 3000:3000 \
+  -v nvidia-kimi-profile:/app/profile \
+  --restart unless-stopped \
+  nvidia-kimi-proxy
+```
+
+### Docker Compose
+
+```bash
+docker compose up -d
+```
+
+### Notas sobre Docker
+
+- Na **primeira execução**, o proxy aceita automaticamente os termos da NVIDIA via `dismissCookieBanner`. O perfil é salvo no volume `profile-data` e reutilizado nas próximas execuções.
+- O container usa o Chromium instalado via apt (`/usr/bin/chromium`).
+- A variável `PLAYWRIGHT_CHROME` já está configurada no `Dockerfile`.
+- Para usar uma porta diferente, altere a variável `PORT` e a porta mapeada no `docker run` ou no `docker-compose.yml`.
+
 ## Estrutura de Arquivos
 
 ```
 nvidia-kimi-proxy/
 ├── playwright-proxy.mjs        # Proxy principal (Node.js + Playwright)
 ├── package.json                # Dependências npm
+├── Dockerfile                  # Imagem Docker
+├── docker-compose.yml          # Orquestração Docker
+├── .dockerignore
 ├── .env.example                # Exemplo de configuração
 ├── .gitignore
 ├── LICENSE                     # Licença MIT
