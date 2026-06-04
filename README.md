@@ -236,12 +236,8 @@ docker compose up -d
 nvidia-kimi-proxy/
 ├── playwright-proxy.mjs        # Proxy principal (Node.js + Playwright)
 ├── package.json                # Dependências npm
-├── Dockerfile                  # Imagem Docker
-├── docker-compose.yml          # Orquestração Docker
-├── .dockerignore
 ├── .env.example                # Exemplo de configuração
 ├── .gitignore
-├── LICENSE                     # Licença MIT
 ├── README.md
 ├── playwright-profile/         # Perfil do Chromium (criado na primeira execução)
 ├── run-playwright-proxy.bat    # Atalho para modo visível
