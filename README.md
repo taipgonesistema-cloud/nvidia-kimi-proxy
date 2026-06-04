@@ -190,6 +190,8 @@ E defina como padrão no `~/.pi/agent/settings.json`:
 
 ## Docker
 
+> **⚠️ Docker ainda em testes.** A execução local é 100% funcional e mais eficiente no momento.
+
 ### Construir e executar
 
 ```bash
