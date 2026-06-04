@@ -582,9 +582,24 @@ async function cdpClickSendFallback(cdp) {
   }
 }
 
+async function cdpClickReset(cdp) {
+  await cdp.send("Runtime.evaluate", {
+    expression: `(() => {
+      const button = [...document.querySelectorAll('button')].find((item) => item.getAttribute('aria-label') === 'Reset');
+      if (!button || button.disabled) return { ok: false };
+      button.click();
+      return { ok: true };
+    })()`,
+    returnByValue: true,
+    awaitPromise: true,
+  }).catch(() => {});
+  await new Promise((r) => setTimeout(r, 300));
+}
+
 async function triggerPlaygroundRequest() {
   await page.bringToFront();
   const cdp = await context.newCDPSession(page);
+  await cdpClickReset(cdp);
   const triggerText = `bridge trigger ${Date.now()}`;
 
   for (let attempt = 1; attempt <= 3; attempt++) {

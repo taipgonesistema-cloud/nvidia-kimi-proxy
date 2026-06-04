@@ -5,10 +5,10 @@ services:
     build: .
     container_name: nvidia-kimi-proxy
     ports:
-      - "3000:3000"
+      - "4874:4874"
     environment:
       - HEADLESS=true
-      - PORT=3000
+      - PORT=4874
       - NVIDIA_THINKING=false
       - NVIDIA_MAX_TOKENS=131072
       - NVIDIA_REQUEST_TIMEOUT_MS=120000
