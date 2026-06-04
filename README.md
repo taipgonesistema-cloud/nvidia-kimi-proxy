@@ -32,10 +32,9 @@ O navegador abrirá sozinho na página do playground da NVIDIA.
 
 ### Primeira execução — aceitar os termos
 
-Na primeira vez, a NVIDIA exibe um modal de **"Acknowledge & Continue"**.
-Clique nele **uma única vez** — o proxy salva a aceitação no perfil do navegador e nunca mais pedirá isso.
+Na primeira vez, execute no **modo visível** (`HEADLESS=false`). O proxy automaticamente aceita os termos e salva no perfil do navegador.
 
-Após aceitar, o proxy já está pronto para uso.
+Após isso, pode usar `HEADLESS=true` nas próximas execuções.
 
 ## Configuração
 
