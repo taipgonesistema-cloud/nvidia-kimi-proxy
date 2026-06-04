@@ -13,13 +13,18 @@ Suporta **tool calling**, **streaming** e integração direta com o [pi.dev](htt
 ## Instalação
 
 ```bash
-# 1. Clone ou copie os arquivos para uma pasta
-cd NVIDIA-PROXY
+# 1. Clone o repositório
+git clone https://github.com/taipgonesistema-cloud/nvidia-kimi-proxy
+cd nvidia-kimi-proxy
 
 # 2. Instale as dependências
 npm install
 
-# 3. Inicie o proxy em modo visível (primeira execução)
+# 3. Copie e configure o .env
+cp .env.example .env
+# Edite o .env conforme necessário (PORT, HEADLESS, etc.)
+
+# 4. Inicie o proxy em modo visível (primeira execução)
 node playwright-proxy.mjs
 ```
 
@@ -32,29 +37,39 @@ Clique nele **uma única vez** — o proxy salva a aceitação no perfil do nave
 
 Após aceitar, o proxy já está pronto para uso.
 
+## Configuração
+
+O proxy carrega automaticamente as variáveis do arquivo `.env` (via dotenv).
+Copie o `.env.example` para `.env` e ajuste:
+
+```env
+PORT=3000              # Porta do proxy
+HEADLESS=false         # true para Chromium oculto
+NVIDIA_THINKING=false  # Habilita raciocínio do modelo
+NVIDIA_MAX_TOKENS=131072
+```
+
 ## Uso
 
 ### Modo visível (testes)
 
 ```bash
-npm start
-# ou
 node playwright-proxy.mjs
 ```
 
 ### Modo headless (produção)
 
-Após já ter aceito os termos uma vez no modo visível:
+Após já ter aceito os termos uma vez no modo visível, edite o `.env`:
 
-```bash
-set HEADLESS=true
-node playwright-proxy.mjs
+```env
+HEADLESS=true
+PORT=3004
 ```
 
-Ou use o atalho:
+E inicie:
 
 ```bash
-run-playwright-proxy-headless.bat
+node playwright-proxy.mjs
 ```
 
 ## Endpoint
@@ -62,6 +77,8 @@ run-playwright-proxy-headless.bat
 ```
 http://localhost:3000/v1/chat/completions
 ```
+
+(ou a porta definida no `.env`)
 
 ### Exemplo com curl
 
@@ -124,7 +141,7 @@ Adicione o provider no `~/.pi/agent/models.json`:
 {
   "providers": {
     "nvidia-kimi": {
-      "baseUrl": "http://localhost:3000/v1",
+      "baseUrl": "http://localhost:3004/v1",
       "api": "openai-completions",
       "apiKey": "dummy",
       "compat": {
@@ -174,13 +191,13 @@ E defina como padrão no `~/.pi/agent/settings.json`:
 ## Estrutura de Arquivos
 
 ```
-NVIDIA-PROXY/
+nvidia-kimi-proxy/
 ├── playwright-proxy.mjs        # Proxy principal (Node.js + Playwright)
 ├── package.json                # Dependências npm
-├── go.mod                      # Módulo Go (funcionalidade adicional)
-├── cmd/                        # Código-fonte Go
-├── internal/                   # Pacotes internos Go
-├── nvidia-proxy.exe            # Binário Go compilado
+├── .env.example                # Exemplo de configuração
+├── .gitignore
+├── LICENSE                     # Licença MIT
+├── README.md
 ├── playwright-profile/         # Perfil do Chromium (criado na primeira execução)
 ├── run-playwright-proxy.bat    # Atalho para modo visível
 └── run-playwright-proxy-headless.bat  # Atalho para modo headless
