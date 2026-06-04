@@ -1,4 +1,15 @@
+<p align="center">
+  <img src="https://raw.githubusercontent.com/MoonshotAI/Kimi-K2/main/figures/kimi-logo.png" alt="Kimi K2.6" width="120"/>
+</p>
+
 # NVIDIA Kimi K2.6 Proxy
+
+<p align="center">
+  <img src="https://img.shields.io/badge/Node.js-20+-339933?logo=node.js&logoColor=white" alt="Node.js"/>
+  <img src="https://img.shields.io/badge/Playwright-1.57+-45ba4b?logo=playwright&logoColor=white" alt="Playwright"/>
+  <img src="https://img.shields.io/badge/Chromium-powered-blue?logo=googlechrome&logoColor=white" alt="Chromium"/>
+  <img src="https://img.shields.io/badge/OpenAI-Compatible-black?logo=openai&logoColor=white" alt="OpenAI Compatible"/>
+</p>
 
 Proxy compatível com OpenAI que redireciona requisições para o modelo `moonshotai/kimi-k2.6` no playground da NVIDIA, usando Playwright + Chromium para autenticação via sessão do navegador.
 
