@@ -1,3 +1,4 @@
+import "dotenv/config";
 import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";

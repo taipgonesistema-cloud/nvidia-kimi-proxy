@@ -7,6 +7,7 @@
     "start": "node playwright-proxy.mjs"
   },
   "dependencies": {
+    "dotenv": "^17.4.2",
     "playwright-core": "^1.57.0"
   }
 }
