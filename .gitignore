@@ -1,0 +1,5 @@
+node_modules/
+playwright-profile*/
+*.log
+.env
+nvidia-proxy.exe

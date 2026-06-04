@@ -1,0 +1,12 @@
+{
+  "name": "nvidia-playwright-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node playwright-proxy.mjs"
+  },
+  "dependencies": {
+    "playwright-core": "^1.57.0"
+  }
+}

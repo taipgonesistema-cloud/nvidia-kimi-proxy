@@ -1,0 +1,780 @@
+import http from "node:http";
+import crypto from "node:crypto";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { chromium } from "playwright-core";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+const MODEL = "moonshotai/kimi-k2.6";
+const PLAYGROUND_URL = "https://build.nvidia.com/moonshotai/kimi-k2.6/playground";
+const PREDICT_ROUTE = "https://api.ngc.nvidia.com/v2/predict/models/**";
+const PORT = Number(process.env.PORT || process.env.PLAYWRIGHT_PROXY_PORT || 3000);
+const USER_DATA_DIR = process.env.PLAYWRIGHT_USER_DATA_DIR || path.join(__dirname, "playwright-profile");
+const HEADLESS = ["1", "true", "yes"].includes(String(process.env.HEADLESS || "").toLowerCase());
+const REQUEST_TIMEOUT_MS = Number(process.env.NVIDIA_REQUEST_TIMEOUT_MS || 120000);
+const DEFAULT_MAX_TOKENS = Number(process.env.NVIDIA_MAX_TOKENS || 131072);
+
+let context = null;
+let page = null;
+let currentPending = null;
+let lock = Promise.resolve();
+let lastRewrite = null;
+let browserInitPromise = null;
+let routeInstalled = false;
+
+function parseBool(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+function profileHasState() {
+  try {
+    const defaultDir = path.join(USER_DATA_DIR, "Default");
+    if (!fs.existsSync(defaultDir)) return false;
+    const cookies = path.join(defaultDir, "Cookies");
+    const network = path.join(defaultDir, "Network Action");
+    return fs.existsSync(cookies) || fs.existsSync(network);
+  } catch { return false; }
+}
+
+function findBrowserExecutable() {
+  if (process.env.PLAYWRIGHT_CHROME && fs.existsSync(process.env.PLAYWRIGHT_CHROME)) {
+    return process.env.PLAYWRIGHT_CHROME;
+  }
+
+  const candidates = [
+    "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+    "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
+    "C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe",
+    path.join(process.env.LOCALAPPDATA || "", "Google", "Chrome", "Application", "chrome.exe"),
+    path.join(process.env.LOCALAPPDATA || "", "Microsoft", "Edge", "Application", "msedge.exe"),
+  ];
+  return candidates.find((candidate) => candidate && fs.existsSync(candidate));
+}
+
+function withLock(fn) {
+  const run = lock.then(fn, fn);
+  lock = run.catch(() => {});
+  return run;
+}
+
+function randomID(prefix = "chatcmpl") {
+  return `${prefix}-${crypto.randomBytes(12).toString("hex")}`;
+}
+
+function createdTime() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function setCORS(res) {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+}
+
+function sendJSON(res, status, data) {
+  setCORS(res);
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.end(JSON.stringify(data));
+}
+
+function sendError(res, status, message) {
+  sendJSON(res, status, { error: { message, type: "error", code: String(status) } });
+}
+
+async function readRequestBody(req, limit = 2 << 20) {
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) throw new Error("request body too large");
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function convertLegacyFunctions(req, payload) {
+  if (!payload.tools && Array.isArray(req.functions)) {
+    payload.tools = req.functions.map((fn) => ({ type: "function", function: fn }));
+  }
+
+  if (payload.tool_choice === undefined && req.function_call !== undefined) {
+    if (typeof req.function_call === "string") {
+      payload.tool_choice = req.function_call;
+    } else if (req.function_call?.name) {
+      payload.tool_choice = { type: "function", function: { name: req.function_call.name } };
+    }
+  }
+}
+
+function buildPredictPayload(req) {
+  if (!Array.isArray(req.messages) || req.messages.length === 0) {
+    throw new Error("messages is required");
+  }
+
+  const payload = {
+    model: MODEL,
+    messages: req.messages,
+    max_tokens: DEFAULT_MAX_TOKENS,
+    stream: true,
+    chat_template_kwargs: { thinking: parseBool(process.env.NVIDIA_THINKING, false) },
+  };
+
+  const copiedFields = [
+    "max_tokens",
+    "max_completion_tokens",
+    "temperature",
+    "top_p",
+    "seed",
+    "user",
+    "stop",
+    "response_format",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+  ];
+  for (const field of copiedFields) {
+    if (req[field] !== undefined && req[field] !== null) payload[field] = req[field];
+  }
+  convertLegacyFunctions(req, payload);
+  return payload;
+}
+
+function mergeToolCall(toolCalls, delta, fallbackIndex) {
+  const index = Number.isInteger(delta?.index) ? delta.index : fallbackIndex;
+  let target = toolCalls.find((item) => Number.isInteger(item.index) && item.index === index);
+  if (!target && delta?.id) target = toolCalls.find((item) => item.id === delta.id);
+  if (!target) {
+    target = { index, id: "", type: "function", function: { name: "", arguments: "" } };
+    toolCalls.push(target);
+  }
+
+  if (delta.id) target.id = delta.id;
+  if (delta.type) target.type = delta.type;
+  if (delta.function?.name) target.function.name = delta.function.name;
+  if (delta.function?.arguments) target.function.arguments += delta.function.arguments;
+}
+
+function messageToolCalls(toolCalls) {
+  return toolCalls.map((toolCall) => ({
+    id: toolCall.id,
+    type: toolCall.type || "function",
+    function: toolCall.function,
+  }));
+}
+
+function streamToolCalls(toolCalls) {
+  return toolCalls.map((toolCall, index) => ({
+    index,
+    id: toolCall.id,
+    type: toolCall.type || "function",
+    function: toolCall.function,
+  }));
+}
+
+function convertSSEToResponse(sseText) {
+  const response = {
+    id: randomID(),
+    object: "chat.completion",
+    created: createdTime(),
+    model: MODEL,
+    choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }],
+  };
+
+  let fullContent = "";
+  let finishReason = null;
+  const toolCalls = [];
+
+  for (const rawLine of String(sseText || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith("data: ")) continue;
+    const data = line.slice(6);
+    if (data === "[DONE]") continue;
+
+    let chunk;
+    try {
+      chunk = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    if (chunk.usage) response.usage = chunk.usage;
+    const choice = chunk.choices?.[0];
+    if (!choice) continue;
+    if (choice.finish_reason) finishReason = choice.finish_reason;
+
+    const delta = choice.delta || {};
+    if (typeof delta.content === "string") fullContent += delta.content;
+    if (Array.isArray(delta.tool_calls)) {
+      delta.tool_calls.forEach((toolCall, index) => mergeToolCall(toolCalls, toolCall, index));
+    }
+  }
+
+  if (toolCalls.length > 0) {
+    response.choices[0].message = { role: "assistant", tool_calls: messageToolCalls(toolCalls) };
+    response.choices[0].finish_reason = finishReason && finishReason !== "stop" ? finishReason : "tool_calls";
+  } else {
+    response.choices[0].message.content = fullContent;
+    if (finishReason) response.choices[0].finish_reason = finishReason;
+  }
+  return response;
+}
+
+function writeSSE(res, data) {
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+function sendOpenAIStream(res, response) {
+  setCORS(res);
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  const choice = response.choices?.[0] || {};
+  writeSSE(res, {
+    id: response.id,
+    object: "chat.completion.chunk",
+    created: response.created,
+    model: response.model,
+    choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+  });
+
+  if (choice.message?.tool_calls?.length) {
+    writeSSE(res, {
+      id: response.id,
+      object: "chat.completion.chunk",
+      created: response.created,
+      model: response.model,
+      choices: [{ index: 0, delta: { tool_calls: streamToolCalls(choice.message.tool_calls) }, finish_reason: null }],
+    });
+  } else if (choice.message?.content) {
+    writeSSE(res, {
+      id: response.id,
+      object: "chat.completion.chunk",
+      created: response.created,
+      model: response.model,
+      choices: [{ index: 0, delta: { content: choice.message.content }, finish_reason: null }],
+    });
+  }
+
+  writeSSE(res, {
+    id: response.id,
+    object: "chat.completion.chunk",
+    created: response.created,
+    model: response.model,
+    choices: [{ index: 0, delta: { content: "" }, finish_reason: choice.finish_reason || "stop" }],
+  });
+
+  if (response.usage) {
+    writeSSE(res, {
+      id: response.id,
+      object: "chat.completion.chunk",
+      created: response.created,
+      model: response.model,
+      choices: [],
+      usage: response.usage,
+    });
+  }
+  res.end("data: [DONE]\n\n");
+}
+
+async function ensureBrowser() {
+  if (context && page && !page.isClosed() && page.url().startsWith(PLAYGROUND_URL)) return;
+  if (browserInitPromise) return browserInitPromise;
+
+  browserInitPromise = (async () => {
+    if (context && page && !page.isClosed()) {
+      await openPlayground(false);
+      return;
+    }
+
+    const executablePath = findBrowserExecutable();
+    if (!executablePath) {
+      throw new Error("Chrome/Edge not found. Set PLAYWRIGHT_CHROME to a Chromium executable path.");
+    }
+
+    fs.mkdirSync(USER_DATA_DIR, { recursive: true });
+    context = await chromium.launchPersistentContext(USER_DATA_DIR, {
+      executablePath,
+      headless: HEADLESS,
+      viewport: { width: 1365, height: 900 },
+      args: ["--disable-blink-features=AutomationControlled"],
+    });
+
+    page = context.pages()[0] || await context.newPage();
+    page.setDefaultTimeout(30000);
+    routeInstalled = false;
+    if (!routeInstalled) {
+      await context.route(PREDICT_ROUTE, handleRoute);
+      routeInstalled = true;
+    }
+    await openPlayground(false);
+  })();
+
+  try {
+    await browserInitPromise;
+  } finally {
+    browserInitPromise = null;
+  }
+}
+
+async function playgroundControlsReady() {
+  return page.evaluate(() => {
+    const input = document.querySelector('[data-testid="nv-text-area-element"]')
+      || document.querySelector('.nv-text-area-element')
+      || document.querySelector('textarea');
+    const send = [...document.querySelectorAll("button")]
+      .find((button) => button.getAttribute("aria-label") === "Send");
+    return !!(input && send
+      && (input.offsetWidth || input.offsetHeight || input.getClientRects().length)
+      && (send.offsetWidth || send.offsetHeight || send.getClientRects().length));
+  }).catch(() => false);
+}
+
+async function waitForPlaygroundReady() {
+  await dismissCookieBanner();
+  await page.waitForFunction(() => document.readyState === "complete", null, { timeout: 60000 }).catch(() => {});
+  await dismissCookieBanner();
+  await page.waitForSelector('[data-testid="nv-text-area-element"], .nv-text-area-element, textarea', { timeout: 60000 });
+  await page.waitForFunction(() => {
+    const input = document.querySelector('[data-testid="nv-text-area-element"]')
+      || document.querySelector('.nv-text-area-element')
+      || document.querySelector('textarea');
+    const send = [...document.querySelectorAll("button")]
+      .find((button) => button.getAttribute("aria-label") === "Send");
+    return input && send
+      && !!(input.offsetWidth || input.offsetHeight || input.getClientRects().length)
+      && !!(send.offsetWidth || send.offsetHeight || send.getClientRects().length);
+  }, null, { timeout: 60000 });
+  await dismissCookieBanner();
+}
+
+async function openPlayground(forceReload) {
+  if (forceReload || !page.url().startsWith(PLAYGROUND_URL)) {
+    await page.goto(PLAYGROUND_URL, { waitUntil: "load", timeout: 90000 });
+  }
+  await waitForPlaygroundReady();
+}
+
+async function preparePlayground() {
+  await ensureBrowser();
+  if (!page.url().startsWith(PLAYGROUND_URL)) {
+    await openPlayground(true);
+    return;
+  }
+  if (await playgroundControlsReady()) return;
+  await waitForPlaygroundReady();
+}
+
+async function handleRoute(route) {
+  const request = route.request();
+  if (request.method() !== "POST" || !request.url().includes("/v2/predict/models/")) {
+    await route.continue();
+    return;
+  }
+
+  const pending = currentPending;
+  if (!pending) {
+    await route.continue();
+    return;
+  }
+
+  pending.request = request;
+  pending.url = request.url();
+  pending.originalPostData = request.postData() || "";
+  const originalSummary = payloadSummary(pending.originalPostData);
+  const rewrittenSummary = payloadSummary(pending.postData);
+  lastRewrite = {
+    id: pending.id,
+    url: pending.url,
+    originalThinking: originalSummary.thinking,
+    rewrittenThinking: rewrittenSummary.thinking,
+    rewrittenMaxTokens: rewrittenSummary.maxTokens,
+    rewrittenMaxCompletionTokens: rewrittenSummary.maxCompletionTokens,
+    rewrittenTemperature: rewrittenSummary.temperature,
+    rewrittenTopP: rewrittenSummary.topP,
+    rewrittenSeed: rewrittenSummary.seed,
+    rewrittenToolsCount: rewrittenSummary.toolsCount,
+    rewrittenToolNames: rewrittenSummary.toolNames,
+    rewrittenToolChoice: rewrittenSummary.toolChoice,
+    rewrittenParallelToolCalls: rewrittenSummary.parallelToolCalls,
+    originalLength: pending.originalPostData.length,
+    rewrittenLength: pending.postData.length,
+    at: Date.now(),
+  };
+  try {
+    const response = await route.fetch({ postData: pending.postData, timeout: REQUEST_TIMEOUT_MS });
+    const body = await response.text();
+    await route.fulfill({ response, body });
+    pending.resolve({
+      status: response.status(),
+      url: pending.url,
+      mimeType: response.headers()["content-type"] || "",
+      body,
+    });
+  } catch (error) {
+    await route.abort().catch(() => {});
+    pending.reject(error);
+  }
+}
+
+function payloadSummary(postData) {
+  try {
+    const payload = JSON.parse(postData || "{}");
+    return {
+      thinking: payload.chat_template_kwargs?.thinking,
+      maxTokens: payload.max_tokens,
+      maxCompletionTokens: payload.max_completion_tokens,
+      temperature: payload.temperature,
+      topP: payload.top_p,
+      seed: payload.seed,
+      toolsCount: Array.isArray(payload.tools) ? payload.tools.length : 0,
+      toolNames: Array.isArray(payload.tools)
+        ? payload.tools.map((tool) => tool?.function?.name).filter(Boolean)
+        : [],
+      toolChoice: payload.tool_choice,
+      parallelToolCalls: payload.parallel_tool_calls,
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function elementCenter(selectorExpression) {
+  return page.evaluate((expression) => {
+    const element = Function(`return (${expression});`)();
+    if (!element) return null;
+    const rect = element.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    return {
+      x: rect.left + rect.width / 2,
+      y: rect.top + rect.height / 2,
+      width: rect.width,
+      height: rect.height,
+    };
+  }, selectorExpression);
+}
+
+async function cdpClick(cdp, point) {
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseMoved",
+    x: point.x,
+    y: point.y,
+    button: "none",
+  });
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mousePressed",
+    x: point.x,
+    y: point.y,
+    button: "left",
+    buttons: 1,
+    clickCount: 1,
+  });
+  await cdp.send("Input.dispatchMouseEvent", {
+    type: "mouseReleased",
+    x: point.x,
+    y: point.y,
+    button: "left",
+    buttons: 0,
+    clickCount: 1,
+  });
+}
+
+async function cdpSetTextareaValue(cdp, text) {
+  const expression = `(() => {
+    const input = document.querySelector('[data-testid="nv-text-area-element"]')
+      || document.querySelector('.nv-text-area-element')
+      || document.querySelector('textarea');
+    if (!input) return { ok: false, error: 'textarea not found' };
+    const proto = Object.getPrototypeOf(input);
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'value')
+      || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+    descriptor.set.call(input, ${JSON.stringify(text)});
+    input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: ${JSON.stringify(text)} }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    input.focus();
+    return { ok: true, value: input.value };
+  })()`;
+  const result = await cdp.send("Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true });
+  if (!result.result?.value?.ok) {
+    throw new Error(result.result?.value?.error || "failed to set textarea via CDP Runtime.evaluate");
+  }
+}
+
+async function cdpClearTextarea(cdp) {
+  const result = await cdp.send("Runtime.evaluate", {
+    expression: `(() => {
+      const input = document.querySelector('[data-testid="nv-text-area-element"]')
+        || document.querySelector('.nv-text-area-element')
+        || document.querySelector('textarea');
+      if (!input) return { ok: false, error: 'textarea not found' };
+      const proto = Object.getPrototypeOf(input);
+      const descriptor = Object.getOwnPropertyDescriptor(proto, 'value')
+        || Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+      descriptor.set.call(input, '');
+      input.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward' }));
+      input.dispatchEvent(new Event('change', { bubbles: true }));
+      input.focus();
+      return { ok: true };
+    })()`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (!result.result?.value?.ok) {
+    throw new Error(result.result?.value?.error || "failed to clear textarea");
+  }
+}
+
+async function sendButtonEnabled(timeout = 3000) {
+  try {
+    await page.waitForFunction(() => {
+      const button = [...document.querySelectorAll("button")].find((item) => item.getAttribute("aria-label") === "Send");
+      return button && !button.disabled;
+    }, null, { timeout });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function dismissCookieBanner() {
+  if (profileHasState()) return;
+  await page.evaluate(() => {
+    const labels = [
+      "Acknowledge & Continue",
+      "Save and Accept",
+      "Accept All",
+      "Accept",
+      "I Accept",
+      "Allow All",
+    ];
+    const buttons = [...document.querySelectorAll("button")];
+    for (const label of labels) {
+      const match = buttons.find(b => {
+        const text = (b.innerText || b.textContent || "").trim();
+        return text === label || text.startsWith(label);
+      });
+      if (match && !match.disabled) { match.click(); break; }
+    }
+  }).catch(() => {});
+  await page.waitForTimeout(1000).catch(() => {});
+}
+
+async function cdpClickSendFallback(cdp) {
+  const result = await cdp.send("Runtime.evaluate", {
+    expression: `(() => {
+      const button = [...document.querySelectorAll('button')].find((item) => item.getAttribute('aria-label') === 'Send');
+      if (!button) return { ok: false, error: 'send button not found' };
+      if (button.disabled) return { ok: false, error: 'send button disabled' };
+      button.click();
+      return { ok: true };
+    })()`,
+    returnByValue: true,
+    awaitPromise: true,
+  });
+  if (!result.result?.value?.ok) {
+    throw new Error(result.result?.value?.error || "send fallback failed");
+  }
+}
+
+async function triggerPlaygroundRequest() {
+  await page.bringToFront();
+  const cdp = await context.newCDPSession(page);
+  const triggerText = `bridge trigger ${Date.now()}`;
+
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const inputPoint = await elementCenter(`document.querySelector('[data-testid="nv-text-area-element"]') || document.querySelector('.nv-text-area-element') || document.querySelector('textarea')`);
+    if (!inputPoint) throw new Error("textarea not found");
+
+    await cdpClick(cdp, inputPoint);
+    await cdpClearTextarea(cdp);
+    await cdp.send("Input.insertText", { text: triggerText }).catch(() => {});
+    if (await sendButtonEnabled()) break;
+
+    await cdpSetTextareaValue(cdp, triggerText);
+    if (await sendButtonEnabled()) break;
+
+    if (attempt === 3) throw new Error("send button did not enable after CDP input");
+    await page.waitForTimeout(500);
+  }
+
+  const sendPoint = await elementCenter(`[...document.querySelectorAll('button')].find((item) => item.getAttribute('aria-label') === 'Send')`);
+  if (!sendPoint) throw new Error("send button not found");
+  await cdpClick(cdp, sendPoint);
+  await new Promise((resolve) => setTimeout(resolve, 750));
+  if (currentPending && !currentPending.request) await cdpClickSendFallback(cdp);
+}
+
+async function pageDebugState() {
+  await ensureBrowser();
+  return page.evaluate(() => {
+    const textarea = document.querySelector('[data-testid="nv-text-area-element"]')
+      || document.querySelector('.nv-text-area-element')
+      || document.querySelector('textarea');
+    const send = [...document.querySelectorAll("button")].find((button) => button.getAttribute("aria-label") === "Send");
+    const buttons = [...document.querySelectorAll("button")]
+      .filter((button) => !!(button.offsetWidth || button.offsetHeight || button.getClientRects().length))
+      .map((button) => ({
+        text: (button.innerText || button.textContent || "").trim().slice(0, 80),
+        aria: button.getAttribute("aria-label"),
+        pressed: button.getAttribute("aria-pressed"),
+        disabled: button.disabled,
+        testid: button.getAttribute("data-testid"),
+        className: String(button.className || "").slice(0, 160),
+      }));
+    return {
+      href: location.href,
+      title: document.title,
+      readyState: document.readyState,
+      activeTag: document.activeElement?.tagName || null,
+      activeTestId: document.activeElement?.getAttribute?.("data-testid") || null,
+      textarea: textarea ? {
+        tag: textarea.tagName,
+        value: textarea.value || "",
+        disabled: textarea.disabled,
+        visible: !!(textarea.offsetWidth || textarea.offsetHeight || textarea.getClientRects().length),
+        testid: textarea.getAttribute("data-testid"),
+        placeholder: textarea.getAttribute("placeholder"),
+      } : null,
+      send: send ? {
+        disabled: send.disabled,
+        visible: !!(send.offsetWidth || send.offsetHeight || send.getClientRects().length),
+        className: String(send.className || "").slice(0, 160),
+      } : null,
+      buttons,
+      bodyTail: (document.body?.innerText || "").slice(-1500),
+    };
+  });
+}
+
+async function predict(postData) {
+  return withLock(async () => {
+    await preparePlayground();
+
+    const pending = {};
+    const responsePromise = new Promise((resolve, reject) => {
+      Object.assign(pending, {
+        id: randomID("predict"),
+        postData,
+        request: null,
+        resolve,
+        reject,
+      });
+    });
+
+    currentPending = pending;
+    try {
+      await triggerPlaygroundRequest();
+      const timeoutPromise = new Promise((_, reject) => {
+        setTimeout(() => reject(new Error("predict timed out waiting for NVIDIA response")), REQUEST_TIMEOUT_MS);
+      });
+      const response = await Promise.race([responsePromise, timeoutPromise]);
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`predict HTTP ${response.status}: ${response.body.slice(0, 1000)}`);
+      }
+      if (!String(response.body || "").includes("data: [DONE]")) {
+        throw new Error("predict response did not finish with data: [DONE]");
+      }
+      return response.body;
+    } finally {
+      currentPending = null;
+    }
+  });
+}
+
+async function chatCompletions(req, res) {
+  let bodyText;
+  try {
+    bodyText = await readRequestBody(req);
+  } catch (error) {
+    sendError(res, 400, error.message);
+    return;
+  }
+
+  let chatReq;
+  try {
+    chatReq = JSON.parse(bodyText || "{}");
+  } catch (error) {
+    sendError(res, 400, `invalid JSON: ${error.message}`);
+    return;
+  }
+
+  let payload;
+  try {
+    payload = buildPredictPayload(chatReq);
+  } catch (error) {
+    sendError(res, 400, error.message);
+    return;
+  }
+
+  try {
+    const sseText = await predict(JSON.stringify(payload));
+    const openAIResponse = convertSSEToResponse(sseText);
+    if (chatReq.stream) sendOpenAIStream(res, openAIResponse);
+    else sendJSON(res, 200, openAIResponse);
+  } catch (error) {
+    sendError(res, 502, `predict failed: ${error.message}`);
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  setCORS(res);
+  if (req.method === "OPTIONS") {
+    res.statusCode = 204;
+    res.end();
+    return;
+  }
+
+  const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
+  if (req.method === "GET" && url.pathname === "/") {
+    sendJSON(res, 200, { service: "nvidia-playwright-proxy", status: "running", port: PORT });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/debug/status") {
+    sendJSON(res, 200, {
+      service: "nvidia-playwright-proxy",
+      browserReady: !!context,
+      pageURL: page && !page.isClosed() ? page.url() : null,
+      pending: currentPending ? { id: currentPending.id, matched: !!currentPending.request } : null,
+      lastRewrite,
+      userDataDir: USER_DATA_DIR,
+      headless: HEADLESS,
+    });
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/debug/page") {
+    try {
+      sendJSON(res, 200, await pageDebugState());
+    } catch (error) {
+      sendError(res, 500, error.message);
+    }
+    return;
+  }
+  if (req.method === "GET" && url.pathname === "/v1/models") {
+    sendJSON(res, 200, {
+      object: "list",
+      data: [{ id: MODEL, object: "model", created: createdTime(), owned_by: "nvidia" }],
+    });
+    return;
+  }
+  if (req.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/v1/chat/completions/")) {
+    await chatCompletions(req, res);
+    return;
+  }
+
+  sendError(res, 404, "not found");
+});
+
+server.listen(PORT, () => {
+  console.log(`[nvidia-playwright-proxy] listening on http://localhost:${PORT}`);
+  ensureBrowser().catch((error) => console.error(`[nvidia-playwright-proxy] browser init failed: ${error.message}`));
+});
+
+process.on("SIGINT", async () => {
+  await context?.close().catch(() => {});
+  process.exit(0);
+});
