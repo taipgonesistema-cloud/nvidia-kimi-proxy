@@ -237,6 +237,3 @@ nvidia-kimi-proxy/
 └── run-playwright-proxy-headless.bat  # Atalho para modo headless
 ```
 
-## Licença
-
-MIT
