@@ -17,6 +17,12 @@ const MODELS = {
   "deepseek-ai/deepseek-v4-pro": {
     id: "deepseek-ai/deepseek-v4-pro",
     playgroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-pro/playground",
+    reasoningEffort: true,
+  },
+  "deepseek-ai/deepseek-v4-flash": {
+    id: "deepseek-ai/deepseek-v4-flash",
+    playgroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-flash/playground",
+    reasoningEffort: true,
   },
   "stepfun-ai/step-3.7-flash": {
     id: "stepfun-ai/step-3.7-flash",
@@ -220,7 +226,7 @@ function buildPredictPayload(req) {
     top_p: DEFAULT_TOP_P,
     stream: true,
   };
-  if (modelInfo.id === "deepseek-ai/deepseek-v4-pro") {
+  if (modelInfo.reasoningEffort) {
     payload.reasoning_effort = DEFAULT_DEEPSEEK_REASONING_EFFORT;
   } else {
     payload.chat_template_kwargs = { thinking: parseBool(process.env.NVIDIA_THINKING, false) };

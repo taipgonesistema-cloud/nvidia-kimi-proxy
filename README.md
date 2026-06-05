@@ -24,6 +24,7 @@ Disponíveis em `GET /v1/models`:
 |---|---:|---|
 | `moonshotai/kimi-k2.6` | Não validado | Modelo padrão |
 | `deepseek-ai/deepseek-v4-pro` | Sim | Envia `reasoning_effort=max` por padrão e retorna `reasoning_content` |
+| `deepseek-ai/deepseek-v4-flash` | Sim | Envia `reasoning_effort=max` por padrão e retorna `reasoning_content` |
 | `stepfun-ai/step-3.7-flash` | Sim | Retorna `reasoning_content` quando a NVIDIA envia |
 
 ## Requisitos
@@ -62,11 +63,11 @@ Variáveis principais:
 | `HOST_PORT` | `4874` | Porta publicada no host pelo Docker Compose |
 | `API_KEY` | vazio | Se definido, exige `Authorization: Bearer <API_KEY>` ou `X-API-Key` em `/v1/*` e `/debug/*` |
 | `HEADLESS` | `false` local, `true` Docker | Roda Chromium oculto |
-| `NVIDIA_THINKING` | `false` | Enviado em `chat_template_kwargs.thinking` para modelos que usam esse campo. Não é injetado no DeepSeek V4 Pro |
+| `NVIDIA_THINKING` | `false` | Enviado em `chat_template_kwargs.thinking` para modelos que usam esse campo. Não é injetado nos DeepSeek V4 |
 | `NVIDIA_MAX_TOKENS` | `131072` | `max_tokens` padrão quando o cliente não envia |
 | `NVIDIA_TEMPERATURE` | `0.2` | `temperature` padrão quando o cliente não envia |
 | `NVIDIA_TOP_P` | `0.8` | `top_p` padrão quando o cliente não envia |
-| `NVIDIA_DEEPSEEK_REASONING_EFFORT` | `max` | `reasoning_effort` padrão do `deepseek-ai/deepseek-v4-pro` |
+| `NVIDIA_DEEPSEEK_REASONING_EFFORT` | `max` | `reasoning_effort` padrão dos modelos DeepSeek V4 |
 | `NVIDIA_REQUEST_TIMEOUT_MS` | `120000` | Timeout máximo por requisição |
 | `PLAYWRIGHT_USER_DATA_DIR` | `./playwright-profile` | Diretório persistente do Chromium |
 | `PLAYWRIGHT_CHROME` | auto-detecção | Caminho do Chrome/Edge/Chromium |
@@ -209,7 +210,7 @@ O deploy em EasyPanel foi validado com:
 - `GET /debug/status`
 - `GET /v1/models`
 - `POST /v1/chat/completions`
-- Os 3 modelos listados acima
+- Os modelos listados acima
 
 ## API
 
@@ -312,7 +313,7 @@ data: {"choices":[{"delta":{"reasoning_content":"..."}}]}
 data: {"choices":[{"delta":{"content":"ok"}}]}
 ```
 
-No DeepSeek V4 Pro, o payload enviado inclui por padrão:
+No DeepSeek V4 Pro e V4 Flash, o payload enviado inclui por padrão:
 
 ```json
 {
@@ -359,7 +360,7 @@ Validado localmente e em EasyPanel/Docker:
 - Chat streaming nos 3 modelos
 - Tool calling non-stream nos 3 modelos
 - Tool calling stream nos 3 modelos
-- `reasoning_content` no DeepSeek V4 Pro e StepFun quando retornado pela NVIDIA
+- `reasoning_content` nos modelos DeepSeek V4 e StepFun quando retornado pela NVIDIA
 - API key via `Authorization: Bearer ...`
 
 ## Como Funciona
@@ -402,6 +403,15 @@ Exemplo de provider em `~/.pi/agent/models.json`:
         {
           "id": "deepseek-ai/deepseek-v4-pro",
           "name": "NVIDIA DeepSeek V4 Pro",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 1000000,
+          "maxTokens": 131072,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "deepseek-ai/deepseek-v4-flash",
+          "name": "NVIDIA DeepSeek V4 Flash",
           "reasoning": true,
           "input": ["text"],
           "contextWindow": 1000000,

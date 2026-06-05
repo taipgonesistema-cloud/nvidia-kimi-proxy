@@ -63,13 +63,15 @@ func hasRawJSON(value json.RawMessage) bool {
 }
 
 type ModelConfig struct {
-	ID            string
-	PlaygroundURL string
+	ID              string
+	PlaygroundURL   string
+	ReasoningEffort bool
 }
 
 var ModelConfigs = []ModelConfig{
 	{ID: "moonshotai/kimi-k2.6", PlaygroundURL: "https://build.nvidia.com/moonshotai/kimi-k2.6/playground"},
-	{ID: "deepseek-ai/deepseek-v4-pro", PlaygroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-pro/playground"},
+	{ID: "deepseek-ai/deepseek-v4-pro", PlaygroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-pro/playground", ReasoningEffort: true},
+	{ID: "deepseek-ai/deepseek-v4-flash", PlaygroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-flash/playground", ReasoningEffort: true},
 	{ID: "stepfun-ai/step-3.7-flash", PlaygroundURL: "https://build.nvidia.com/stepfun-ai/step-3.7-flash/playground"},
 }
 
@@ -95,7 +97,7 @@ func BuildPredictPayload(req ChatRequest) map[string]any {
 		"top_p":       EnvFloat("NVIDIA_TOP_P", 0.8),
 		"stream":      true,
 	}
-	if model.ID == "deepseek-ai/deepseek-v4-pro" {
+	if model.ReasoningEffort {
 		payload["reasoning_effort"] = EnvOr("NVIDIA_DEEPSEEK_REASONING_EFFORT", "max")
 	} else {
 		payload["chat_template_kwargs"] = map[string]any{"thinking": thinking}
