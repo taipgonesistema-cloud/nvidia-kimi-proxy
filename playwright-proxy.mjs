@@ -544,25 +544,31 @@ async function sendButtonEnabled(timeout = 3000) {
 
 async function dismissCookieBanner() {
   if (profileHasState()) return;
-  await page.evaluate(() => {
-    const labels = [
-      "Acknowledge & Continue",
-      "Save and Accept",
-      "Accept All",
-      "Accept",
-      "I Accept",
-      "Allow All",
-    ];
-    const buttons = [...document.querySelectorAll("button")];
-    for (const label of labels) {
-      const match = buttons.find(b => {
-        const text = (b.innerText || b.textContent || "").trim();
-        return text === label || text.startsWith(label);
-      });
-      if (match && !match.disabled) { match.click(); break; }
-    }
-  }).catch(() => {});
-  await page.waitForTimeout(1000).catch(() => {});
+
+  const clickButton = async (selector, text) => {
+    try {
+      if (selector) {
+        const el = await page.$(selector);
+        if (el) { await el.click().catch(() => {}); return true; }
+      }
+      if (text) {
+        await page.evaluate((t) => {
+          const btn = [...document.querySelectorAll("button")].find(
+            b => (b.innerText || b.textContent || "").trim() === t
+          );
+          if (btn && !btn.disabled) btn.click();
+        }, text).catch(() => {});
+        return true;
+      }
+    } catch {}
+    return false;
+  };
+
+  await clickButton("#onetrust-accept-btn-handler", "Accept All");
+  await page.waitForTimeout(2000);
+
+  await clickButton(null, "Acknowledge & Continue");
+  await page.waitForTimeout(1000);
 }
 
 async function cdpClickSendFallback(cdp) {
