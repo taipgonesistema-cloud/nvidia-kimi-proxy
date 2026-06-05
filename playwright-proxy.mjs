@@ -621,8 +621,6 @@ async function sendButtonEnabled(timeout = 3000) {
 }
 
 async function dismissCookieBanner() {
-  if (profileHasState()) return;
-
   const clickButton = async (selector, text) => {
     try {
       if (selector) {
