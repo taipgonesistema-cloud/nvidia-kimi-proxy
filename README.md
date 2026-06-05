@@ -19,6 +19,7 @@ Suporta **tool calling**, **streaming** e integração direta com o [pi.dev](htt
 
 - **Node.js** 18+ (com `npm`)
 - **Google Chrome** ou **Microsoft Edge** instalado
+- **Docker** opcional, para rodar em container
 - Conexão com internet
 
 ## Instalação
@@ -53,7 +54,7 @@ O proxy carrega automaticamente as variáveis do arquivo `.env` (via dotenv).
 Copie o `.env.example` para `.env` e ajuste:
 
 ```env
-PORT=3000              # Porta do proxy
+PORT=4874              # Porta do proxy
 API_KEY=               # Opcional: exige Authorization: Bearer <API_KEY>
 HEADLESS=false         # true para Chromium oculto
 NVIDIA_THINKING=false  # Habilita raciocínio do modelo
@@ -77,7 +78,7 @@ Após já ter aceito os termos uma vez no modo visível, edite o `.env`:
 
 ```env
 HEADLESS=true
-PORT=3004
+PORT=4874
 ```
 
 E inicie:
@@ -89,7 +90,7 @@ node playwright-proxy.mjs
 ## Endpoint
 
 ```
-http://localhost:3000/v1/chat/completions
+http://localhost:4874/v1/chat/completions
 ```
 
 (ou a porta definida no `.env`)
@@ -103,7 +104,7 @@ Modelos disponíveis em `/v1/models`:
 ### Exemplo com curl
 
 ```bash
-curl http://localhost:3000/v1/chat/completions \
+curl http://localhost:4874/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "moonshotai/kimi-k2.6",
@@ -115,7 +116,7 @@ curl http://localhost:3000/v1/chat/completions \
 ### Exemplo com tool calling
 
 ```bash
-curl http://localhost:3000/v1/chat/completions \
+curl http://localhost:4874/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "moonshotai/kimi-k2.6",
@@ -145,7 +146,8 @@ curl http://localhost:3000/v1/chat/completions \
 
 | Variável | Padrão | Descrição |
 |---|---|---|
-| `PORT` | `3000` | Porta do servidor proxy |
+| `PORT` | `4874` | Porta do servidor proxy |
+| `HOST_PORT` | `4874` | Porta publicada no host pelo `docker-compose.yml` |
 | `API_KEY` | vazio | Se definido, exige `Authorization: Bearer <API_KEY>` ou `X-API-Key` nos endpoints `/v1/*` e `/debug/*` |
 | `HEADLESS` | `false` | `true` para rodar o Chromium em modo oculto |
 | `NVIDIA_THINKING` | `false` | Habilita raciocínio (thinking) do modelo |
@@ -165,7 +167,7 @@ Adicione o provider no `~/.pi/agent/models.json`:
 {
   "providers": {
     "nvidia-kimi": {
-      "baseUrl": "http://localhost:3004/v1",
+      "baseUrl": "http://localhost:4874/v1",
       "api": "openai-completions",
       "apiKey": "dummy",
       "compat": {
@@ -210,11 +212,14 @@ E defina como padrão no `~/.pi/agent/settings.json`:
 3. Ao receber uma requisição, insere o payload no textarea do playground e clica em Enviar
 4. Intercepta a requisição de predição e substitui o body pelos dados do cliente
 5. A resposta SSE é convertida de volta para o formato OpenAI
-6. O campo `chat_template_kwargs.thinking` é sempre definido como `false` (a menos que `NVIDIA_THINKING=true`)
+6. Modelos com suporte a reasoning expõem `reasoning_content` quando a NVIDIA envia esse campo
+7. Para DeepSeek V4 Pro, `reasoning_effort=max` é enviado por padrão e `chat_template_kwargs.thinking` não é injetado
 
 ## Docker
 
-> **⚠️ Docker ainda em testes.** A execução local é 100% funcional e mais eficiente no momento.
+O container instala Chromium via `apt`, roda em `HEADLESS=true` e salva o perfil persistente em `/app/profile`.
+
+> A primeira subida em profile limpo foi validada em headless. O proxy tenta aceitar automaticamente os termos/cookies do playground e reutiliza o perfil salvo no volume.
 
 ### Construir e executar
 
@@ -225,7 +230,25 @@ docker build -t nvidia-kimi-proxy .
 # Executar o container
 docker run -d \
   --name nvidia-kimi-proxy \
-  -p 3000:3000 \
+  -p 4874:4874 \
+  -e API_KEY="sua-chave-local" \
+  -v nvidia-kimi-profile:/app/profile \
+  --restart unless-stopped \
+  nvidia-kimi-proxy
+```
+
+Se quiser reaproveitar variáveis do `.env`, passe-as explicitamente com `--env-file`, mas sobrescreva o perfil para o caminho Linux do container:
+
+```bash
+docker run -d \
+  --name nvidia-kimi-proxy \
+  -p 4874:4874 \
+  --env-file .env \
+  -e PORT=4874 \
+  -e HEADLESS=true \
+  -e PLAYWRIGHT_CHROME=/usr/bin/chromium \
+  -e PLAYWRIGHT_USER_DATA_DIR=/app/profile \
+  -e PLAYWRIGHT_CHROMIUM_ARGS="--no-sandbox --disable-dev-shm-usage" \
   -v nvidia-kimi-profile:/app/profile \
   --restart unless-stopped \
   nvidia-kimi-proxy
@@ -237,12 +260,26 @@ docker run -d \
 docker compose up -d
 ```
 
+Por padrão o compose publica `localhost:4874`. Para outra porta no host:
+
+```bash
+HOST_PORT=4875 docker compose up -d
+```
+
+No Windows `cmd`:
+
+```bat
+set HOST_PORT=4875
+docker compose up -d
+```
+
 ### Notas sobre Docker
 
-- Na **primeira execução**, o proxy aceita automaticamente os termos da NVIDIA via `dismissCookieBanner`. O perfil é salvo no volume `profile-data` e reutilizado nas próximas execuções.
+- Na **primeira execução**, o proxy aceita automaticamente os termos da NVIDIA via `dismissCookieBanner`. O perfil é salvo no volume `nvidia-kimi-profile` e reutilizado nas próximas execuções.
 - O container usa o Chromium instalado via apt (`/usr/bin/chromium`).
-- A variável `PLAYWRIGHT_CHROME` já está configurada no `Dockerfile`.
-- Para usar uma porta diferente, altere a variável `PORT` e a porta mapeada no `docker run` ou no `docker-compose.yml`.
+- `PLAYWRIGHT_CHROME`, `PLAYWRIGHT_USER_DATA_DIR` e `PLAYWRIGHT_CHROMIUM_ARGS` já vêm configurados no `Dockerfile` e no `docker-compose.yml`.
+- Use `HOST_PORT` para mudar a porta publicada pelo compose. Mantenha `PORT=4874` dentro do container salvo se souber que precisa alterar.
+- O healthcheck chama `GET /`, que não exige `API_KEY`.
 
 ## Estrutura de Arquivos
 
@@ -250,6 +287,9 @@ docker compose up -d
 nvidia-kimi-proxy/
 ├── playwright-proxy.mjs        # Proxy principal (Node.js + Playwright)
 ├── package.json                # Dependências npm
+├── Dockerfile                  # Imagem Node + Chromium
+├── docker-compose.yml          # Serviço Docker com volume persistente
+├── .dockerignore
 ├── .env.example                # Exemplo de configuração
 ├── .gitignore
 ├── README.md

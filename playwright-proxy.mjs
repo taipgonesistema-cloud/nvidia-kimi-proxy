@@ -24,7 +24,7 @@ const MODELS = {
   },
 };
 const PREDICT_ROUTE = "https://api.ngc.nvidia.com/v2/predict/models/**";
-const PORT = Number(process.env.PORT || process.env.PLAYWRIGHT_PROXY_PORT || 3000);
+const PORT = Number(process.env.PORT || process.env.PLAYWRIGHT_PROXY_PORT || 4874);
 const USER_DATA_DIR = process.env.PLAYWRIGHT_USER_DATA_DIR || path.join(__dirname, "playwright-profile");
 const HEADLESS = ["1", "true", "yes"].includes(String(process.env.HEADLESS || "").toLowerCase());
 const REQUEST_TIMEOUT_MS = Number(process.env.NVIDIA_REQUEST_TIMEOUT_MS || 120000);
@@ -63,6 +63,11 @@ function findBrowserExecutable() {
   }
 
   const candidates = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/snap/bin/chromium",
     "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
     "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
     "C:\\Program Files\\Microsoft\\Edge\\Application\\msedge.exe",
@@ -71,6 +76,14 @@ function findBrowserExecutable() {
     path.join(process.env.LOCALAPPDATA || "", "Microsoft", "Edge", "Application", "msedge.exe"),
   ];
   return candidates.find((candidate) => candidate && fs.existsSync(candidate));
+}
+
+function chromiumArgs() {
+  const extraArgs = String(process.env.PLAYWRIGHT_CHROMIUM_ARGS || "")
+    .split(/\s+/)
+    .map((arg) => arg.trim())
+    .filter(Boolean);
+  return ["--disable-blink-features=AutomationControlled", ...extraArgs];
 }
 
 function withLock(fn) {
@@ -366,7 +379,7 @@ async function ensureBrowser(modelInfo = MODELS[DEFAULT_MODEL]) {
       executablePath,
       headless: HEADLESS,
       viewport: { width: 1365, height: 900 },
-      args: ["--disable-blink-features=AutomationControlled"],
+      args: chromiumArgs(),
     });
 
     page = context.pages()[0] || await context.newPage();

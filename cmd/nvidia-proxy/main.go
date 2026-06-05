@@ -14,7 +14,7 @@ import (
 )
 
 func main() {
-	port := utils.EnvOr("PORT", "3000")
+	port := utils.EnvOr("PORT", "4874")
 	tabID := utils.EnvOr("TAB_ID", "196650910")
 
 	b := bridge.New(tabID)

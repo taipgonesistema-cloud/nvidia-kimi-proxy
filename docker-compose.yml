@@ -1,0 +1,25 @@
+services:
+  nvidia-kimi-proxy:
+    build: .
+    container_name: nvidia-kimi-proxy
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-4874}:4874"
+    environment:
+      PORT: "4874"
+      API_KEY: "${API_KEY:-}"
+      HEADLESS: "true"
+      NVIDIA_THINKING: "${NVIDIA_THINKING:-false}"
+      NVIDIA_MAX_TOKENS: "${NVIDIA_MAX_TOKENS:-131072}"
+      NVIDIA_TEMPERATURE: "${NVIDIA_TEMPERATURE:-0.2}"
+      NVIDIA_TOP_P: "${NVIDIA_TOP_P:-0.8}"
+      NVIDIA_DEEPSEEK_REASONING_EFFORT: "${NVIDIA_DEEPSEEK_REASONING_EFFORT:-max}"
+      NVIDIA_REQUEST_TIMEOUT_MS: "${NVIDIA_REQUEST_TIMEOUT_MS:-120000}"
+      PLAYWRIGHT_CHROME: "/usr/bin/chromium"
+      PLAYWRIGHT_USER_DATA_DIR: "/app/profile"
+      PLAYWRIGHT_CHROMIUM_ARGS: "--no-sandbox --disable-dev-shm-usage"
+    volumes:
+      - nvidia-kimi-profile:/app/profile
+
+volumes:
+  nvidia-kimi-profile:
