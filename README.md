@@ -468,6 +468,20 @@ Para VPS pequena, o proxy aplica algumas economias por padrão:
 - Desativa recursos de background do Chromium via flags.
 - Fecha o browser após `PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS` sem requisições.
 
+### Idle do Chromium
+
+O idle funciona como um ciclo automático:
+
+1. Uma requisição chega em `/v1/chat/completions`.
+2. O proxy chama `ensureBrowser()`.
+3. Se o Chromium estiver fechado, ele abre de novo e carrega o playground do modelo pedido.
+4. A requisição é processada normalmente.
+5. Quando termina, o proxy agenda o timer de idle.
+6. Se não chegar nenhuma nova requisição até `PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS`, o Chromium é fechado.
+7. A próxima requisição reabre o Chromium automaticamente.
+
+Isso reduz CPU/RAM quando o serviço fica parado. O custo é que a primeira requisição depois do idle demora mais, porque precisa iniciar o navegador e carregar o playground outra vez.
+
 Configuração recomendada no Docker/EasyPanel:
 
 ```env
@@ -480,6 +494,12 @@ Se quiser zerar CPU quando não estiver usando, reduza o idle timeout:
 
 ```env
 PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS=60000
+```
+
+Para manter o Chromium sempre aberto, desative o idle:
+
+```env
+PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS=0
 ```
 
 Trade-off: quando o Chromium fecha por idle, a próxima requisição demora mais porque precisa abrir o navegador e carregar o playground novamente.
