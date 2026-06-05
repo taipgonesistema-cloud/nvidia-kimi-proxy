@@ -8,14 +8,31 @@ import { chromium } from "playwright-core";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const MODEL = "moonshotai/kimi-k2.6";
-const PLAYGROUND_URL = "https://build.nvidia.com/moonshotai/kimi-k2.6/playground";
+const DEFAULT_MODEL = "moonshotai/kimi-k2.6";
+const MODELS = {
+  "moonshotai/kimi-k2.6": {
+    id: "moonshotai/kimi-k2.6",
+    playgroundURL: "https://build.nvidia.com/moonshotai/kimi-k2.6/playground",
+  },
+  "deepseek-ai/deepseek-v4-pro": {
+    id: "deepseek-ai/deepseek-v4-pro",
+    playgroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-pro/playground",
+  },
+  "stepfun-ai/step-3.7-flash": {
+    id: "stepfun-ai/step-3.7-flash",
+    playgroundURL: "https://build.nvidia.com/stepfun-ai/step-3.7-flash/playground",
+  },
+};
 const PREDICT_ROUTE = "https://api.ngc.nvidia.com/v2/predict/models/**";
 const PORT = Number(process.env.PORT || process.env.PLAYWRIGHT_PROXY_PORT || 3000);
 const USER_DATA_DIR = process.env.PLAYWRIGHT_USER_DATA_DIR || path.join(__dirname, "playwright-profile");
 const HEADLESS = ["1", "true", "yes"].includes(String(process.env.HEADLESS || "").toLowerCase());
 const REQUEST_TIMEOUT_MS = Number(process.env.NVIDIA_REQUEST_TIMEOUT_MS || 120000);
 const DEFAULT_MAX_TOKENS = Number(process.env.NVIDIA_MAX_TOKENS || 131072);
+const DEFAULT_TEMPERATURE = Number(process.env.NVIDIA_TEMPERATURE || 0.2);
+const DEFAULT_TOP_P = Number(process.env.NVIDIA_TOP_P || 0.8);
+const API_KEY = process.env.API_KEY || "";
+const DEFAULT_DEEPSEEK_REASONING_EFFORT = process.env.NVIDIA_DEEPSEEK_REASONING_EFFORT || "max";
 
 let context = null;
 let page = null;
@@ -73,7 +90,7 @@ function createdTime() {
 function setCORS(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key");
 }
 
 function sendJSON(res, status, data) {
@@ -85,6 +102,19 @@ function sendJSON(res, status, data) {
 
 function sendError(res, status, message) {
   sendJSON(res, status, { error: { message, type: "error", code: String(status) } });
+}
+
+function requestHasValidAPIKey(req) {
+  if (!API_KEY) return true;
+  const authorization = String(req.headers.authorization || "");
+  const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1];
+  return bearer === API_KEY || req.headers["x-api-key"] === API_KEY;
+}
+
+function requireAPIKey(req, res) {
+  if (requestHasValidAPIKey(req)) return true;
+  sendError(res, 401, "invalid or missing API key");
+  return false;
 }
 
 async function readRequestBody(req, limit = 2 << 20) {
@@ -112,18 +142,35 @@ function convertLegacyFunctions(req, payload) {
   }
 }
 
+function resolveModel(model) {
+  const modelId = model || DEFAULT_MODEL;
+  const modelInfo = MODELS[modelId];
+  if (!modelInfo) {
+    throw new Error(`unsupported model: ${modelId}`);
+  }
+  return modelInfo;
+}
+
 function buildPredictPayload(req) {
   if (!Array.isArray(req.messages) || req.messages.length === 0) {
     throw new Error("messages is required");
   }
 
+  const modelInfo = resolveModel(req.model);
+
   const payload = {
-    model: MODEL,
+    model: modelInfo.id,
     messages: req.messages,
     max_tokens: DEFAULT_MAX_TOKENS,
+    temperature: DEFAULT_TEMPERATURE,
+    top_p: DEFAULT_TOP_P,
     stream: true,
-    chat_template_kwargs: { thinking: parseBool(process.env.NVIDIA_THINKING, false) },
   };
+  if (modelInfo.id === "deepseek-ai/deepseek-v4-pro") {
+    payload.reasoning_effort = DEFAULT_DEEPSEEK_REASONING_EFFORT;
+  } else {
+    payload.chat_template_kwargs = { thinking: parseBool(process.env.NVIDIA_THINKING, false) };
+  }
 
   const copiedFields = [
     "max_tokens",
@@ -137,12 +184,14 @@ function buildPredictPayload(req) {
     "tools",
     "tool_choice",
     "parallel_tool_calls",
+    "reasoning_effort",
+    "stream_options",
   ];
   for (const field of copiedFields) {
     if (req[field] !== undefined && req[field] !== null) payload[field] = req[field];
   }
   convertLegacyFunctions(req, payload);
-  return payload;
+  return { payload, modelInfo };
 }
 
 function mergeToolCall(toolCalls, delta, fallbackIndex) {
@@ -177,16 +226,17 @@ function streamToolCalls(toolCalls) {
   }));
 }
 
-function convertSSEToResponse(sseText) {
+function convertSSEToResponse(sseText, modelId) {
   const response = {
     id: randomID(),
     object: "chat.completion",
     created: createdTime(),
-    model: MODEL,
+    model: modelId,
     choices: [{ index: 0, message: { role: "assistant", content: "" }, finish_reason: "stop" }],
   };
 
   let fullContent = "";
+  let fullReasoningContent = "";
   let finishReason = null;
   const toolCalls = [];
 
@@ -209,6 +259,7 @@ function convertSSEToResponse(sseText) {
 
     const delta = choice.delta || {};
     if (typeof delta.content === "string") fullContent += delta.content;
+    if (typeof delta.reasoning_content === "string") fullReasoningContent += delta.reasoning_content;
     if (Array.isArray(delta.tool_calls)) {
       delta.tool_calls.forEach((toolCall, index) => mergeToolCall(toolCalls, toolCall, index));
     }
@@ -216,9 +267,11 @@ function convertSSEToResponse(sseText) {
 
   if (toolCalls.length > 0) {
     response.choices[0].message = { role: "assistant", tool_calls: messageToolCalls(toolCalls) };
+    if (fullReasoningContent) response.choices[0].message.reasoning_content = fullReasoningContent;
     response.choices[0].finish_reason = finishReason && finishReason !== "stop" ? finishReason : "tool_calls";
   } else {
     response.choices[0].message.content = fullContent;
+    if (fullReasoningContent) response.choices[0].message.reasoning_content = fullReasoningContent;
     if (finishReason) response.choices[0].finish_reason = finishReason;
   }
   return response;
@@ -243,6 +296,16 @@ function sendOpenAIStream(res, response) {
     model: response.model,
     choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
   });
+
+  if (choice.message?.reasoning_content) {
+    writeSSE(res, {
+      id: response.id,
+      object: "chat.completion.chunk",
+      created: response.created,
+      model: response.model,
+      choices: [{ index: 0, delta: { reasoning_content: choice.message.reasoning_content }, finish_reason: null }],
+    });
+  }
 
   if (choice.message?.tool_calls?.length) {
     writeSSE(res, {
@@ -283,13 +346,13 @@ function sendOpenAIStream(res, response) {
   res.end("data: [DONE]\n\n");
 }
 
-async function ensureBrowser() {
-  if (context && page && !page.isClosed() && page.url().startsWith(PLAYGROUND_URL)) return;
+async function ensureBrowser(modelInfo = MODELS[DEFAULT_MODEL]) {
+  if (context && page && !page.isClosed() && page.url().startsWith(modelInfo.playgroundURL)) return;
   if (browserInitPromise) return browserInitPromise;
 
   browserInitPromise = (async () => {
     if (context && page && !page.isClosed()) {
-      await openPlayground(false);
+      await openPlayground(modelInfo, false);
       return;
     }
 
@@ -313,7 +376,7 @@ async function ensureBrowser() {
       await context.route(PREDICT_ROUTE, handleRoute);
       routeInstalled = true;
     }
-    await openPlayground(false);
+    await openPlayground(modelInfo, false);
   })();
 
   try {
@@ -354,17 +417,17 @@ async function waitForPlaygroundReady() {
   await dismissCookieBanner();
 }
 
-async function openPlayground(forceReload) {
-  if (forceReload || !page.url().startsWith(PLAYGROUND_URL)) {
-    await page.goto(PLAYGROUND_URL, { waitUntil: "load", timeout: 90000 });
+async function openPlayground(modelInfo, forceReload) {
+  if (forceReload || !page.url().startsWith(modelInfo.playgroundURL)) {
+    await page.goto(modelInfo.playgroundURL, { waitUntil: "load", timeout: 90000 });
   }
   await waitForPlaygroundReady();
 }
 
-async function preparePlayground() {
-  await ensureBrowser();
-  if (!page.url().startsWith(PLAYGROUND_URL)) {
-    await openPlayground(true);
+async function preparePlayground(modelInfo) {
+  await ensureBrowser(modelInfo);
+  if (!page.url().startsWith(modelInfo.playgroundURL)) {
+    await openPlayground(modelInfo, true);
     return;
   }
   if (await playgroundControlsReady()) return;
@@ -398,6 +461,7 @@ async function handleRoute(route) {
     rewrittenMaxCompletionTokens: rewrittenSummary.maxCompletionTokens,
     rewrittenTemperature: rewrittenSummary.temperature,
     rewrittenTopP: rewrittenSummary.topP,
+    rewrittenReasoningEffort: rewrittenSummary.reasoningEffort,
     rewrittenSeed: rewrittenSummary.seed,
     rewrittenToolsCount: rewrittenSummary.toolsCount,
     rewrittenToolNames: rewrittenSummary.toolNames,
@@ -432,6 +496,7 @@ function payloadSummary(postData) {
       maxCompletionTokens: payload.max_completion_tokens,
       temperature: payload.temperature,
       topP: payload.top_p,
+      reasoningEffort: payload.reasoning_effort,
       seed: payload.seed,
       toolsCount: Array.isArray(payload.tools) ? payload.tools.length : 0,
       toolNames: Array.isArray(payload.tools)
@@ -658,9 +723,9 @@ async function pageDebugState() {
   });
 }
 
-async function predict(postData) {
+async function predict(postData, modelInfo) {
   return withLock(async () => {
-    await preparePlayground();
+    await preparePlayground(modelInfo);
 
     const pending = {};
     const responsePromise = new Promise((resolve, reject) => {
@@ -711,16 +776,17 @@ async function chatCompletions(req, res) {
   }
 
   let payload;
+  let modelInfo;
   try {
-    payload = buildPredictPayload(chatReq);
+    ({ payload, modelInfo } = buildPredictPayload(chatReq));
   } catch (error) {
     sendError(res, 400, error.message);
     return;
   }
 
   try {
-    const sseText = await predict(JSON.stringify(payload));
-    const openAIResponse = convertSSEToResponse(sseText);
+    const sseText = await predict(JSON.stringify(payload), modelInfo);
+    const openAIResponse = convertSSEToResponse(sseText, modelInfo.id);
     if (chatReq.stream) sendOpenAIStream(res, openAIResponse);
     else sendJSON(res, 200, openAIResponse);
   } catch (error) {
@@ -742,6 +808,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === "GET" && url.pathname === "/debug/status") {
+    if (!requireAPIKey(req, res)) return;
     sendJSON(res, 200, {
       service: "nvidia-playwright-proxy",
       browserReady: !!context,
@@ -754,6 +821,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === "GET" && url.pathname === "/debug/page") {
+    if (!requireAPIKey(req, res)) return;
     try {
       sendJSON(res, 200, await pageDebugState());
     } catch (error) {
@@ -762,13 +830,20 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (req.method === "GET" && url.pathname === "/v1/models") {
+    if (!requireAPIKey(req, res)) return;
     sendJSON(res, 200, {
       object: "list",
-      data: [{ id: MODEL, object: "model", created: createdTime(), owned_by: "nvidia" }],
+      data: Object.values(MODELS).map((model) => ({
+        id: model.id,
+        object: "model",
+        created: createdTime(),
+        owned_by: "nvidia",
+      })),
     });
     return;
   }
   if (req.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/v1/chat/completions/")) {
+    if (!requireAPIKey(req, res)) return;
     await chatCompletions(req, res);
     return;
   }

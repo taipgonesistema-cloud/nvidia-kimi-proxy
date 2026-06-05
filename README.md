@@ -54,9 +54,13 @@ Copie o `.env.example` para `.env` e ajuste:
 
 ```env
 PORT=3000              # Porta do proxy
+API_KEY=               # Opcional: exige Authorization: Bearer <API_KEY>
 HEADLESS=false         # true para Chromium oculto
 NVIDIA_THINKING=false  # Habilita raciocínio do modelo
 NVIDIA_MAX_TOKENS=131072
+NVIDIA_TEMPERATURE=0.2 # Mais baixo = respostas mais determinísticas
+NVIDIA_TOP_P=0.8       # Limita amostragem para reduzir deriva/alucinação
+NVIDIA_DEEPSEEK_REASONING_EFFORT=max
 ```
 
 ## Uso
@@ -89,6 +93,12 @@ http://localhost:3000/v1/chat/completions
 ```
 
 (ou a porta definida no `.env`)
+
+Modelos disponíveis em `/v1/models`:
+
+- `moonshotai/kimi-k2.6`
+- `deepseek-ai/deepseek-v4-pro`
+- `stepfun-ai/step-3.7-flash`
 
 ### Exemplo com curl
 
@@ -136,9 +146,13 @@ curl http://localhost:3000/v1/chat/completions \
 | Variável | Padrão | Descrição |
 |---|---|---|
 | `PORT` | `3000` | Porta do servidor proxy |
+| `API_KEY` | vazio | Se definido, exige `Authorization: Bearer <API_KEY>` ou `X-API-Key` nos endpoints `/v1/*` e `/debug/*` |
 | `HEADLESS` | `false` | `true` para rodar o Chromium em modo oculto |
 | `NVIDIA_THINKING` | `false` | Habilita raciocínio (thinking) do modelo |
 | `NVIDIA_MAX_TOKENS` | `131072` | `max_tokens` padrão quando o cliente não envia |
+| `NVIDIA_TEMPERATURE` | `0.2` | `temperature` padrão quando o cliente não envia |
+| `NVIDIA_TOP_P` | `0.8` | `top_p` padrão quando o cliente não envia |
+| `NVIDIA_DEEPSEEK_REASONING_EFFORT` | `max` | `reasoning_effort` padrão para `deepseek-ai/deepseek-v4-pro` |
 | `NVIDIA_REQUEST_TIMEOUT_MS` | `120000` | Timeout máximo por requisição (ms) |
 | `PLAYWRIGHT_USER_DATA_DIR` | `./playwright-profile` | Pasta do perfil do Chromium |
 | `PLAYWRIGHT_CHROME` | (auto-detecção) | Caminho do executável do Chrome/Edge |
@@ -243,4 +257,3 @@ nvidia-kimi-proxy/
 ├── run-playwright-proxy.bat    # Atalho para modo visível
 └── run-playwright-proxy-headless.bat  # Atalho para modo headless
 ```
-

@@ -26,6 +26,15 @@ func EnvInt(key string, fallback int) int {
 	return fallback
 }
 
+func EnvFloat(key string, fallback float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseFloat(v, 64); err == nil {
+			return n
+		}
+	}
+	return fallback
+}
+
 func RandomID() string {
 	b := make([]byte, 12)
 	rand.Read(b)
@@ -39,7 +48,7 @@ func CreatedTime() int64 {
 func SetCORS(headers func(key, value string)) {
 	headers("Access-Control-Allow-Origin", "*")
 	headers("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-	headers("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	headers("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
 }
 
 func MakeToolCallID() string {
@@ -53,13 +62,43 @@ func hasRawJSON(value json.RawMessage) bool {
 	return trimmed != "" && trimmed != "null"
 }
 
+type ModelConfig struct {
+	ID            string
+	PlaygroundURL string
+}
+
+var ModelConfigs = []ModelConfig{
+	{ID: "moonshotai/kimi-k2.6", PlaygroundURL: "https://build.nvidia.com/moonshotai/kimi-k2.6/playground"},
+	{ID: "deepseek-ai/deepseek-v4-pro", PlaygroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-pro/playground"},
+	{ID: "stepfun-ai/step-3.7-flash", PlaygroundURL: "https://build.nvidia.com/stepfun-ai/step-3.7-flash/playground"},
+}
+
+func ResolveModel(model string) (ModelConfig, bool) {
+	if model == "" {
+		return ModelConfigs[0], true
+	}
+	for _, cfg := range ModelConfigs {
+		if cfg.ID == model {
+			return cfg, true
+		}
+	}
+	return ModelConfig{}, false
+}
+
 func BuildPredictPayload(req ChatRequest) map[string]any {
 	thinking := strings.EqualFold(EnvOr("NVIDIA_THINKING", "false"), "true") || EnvOr("NVIDIA_THINKING", "false") == "1"
+	model, _ := ResolveModel(req.Model)
 	payload := map[string]any{
-		"model":                "moonshotai/kimi-k2.6",
-		"messages":             req.Messages,
-		"stream":               true,
-		"chat_template_kwargs": map[string]any{"thinking": thinking},
+		"model":       model.ID,
+		"messages":    req.Messages,
+		"temperature": EnvFloat("NVIDIA_TEMPERATURE", 0.2),
+		"top_p":       EnvFloat("NVIDIA_TOP_P", 0.8),
+		"stream":      true,
+	}
+	if model.ID == "deepseek-ai/deepseek-v4-pro" {
+		payload["reasoning_effort"] = EnvOr("NVIDIA_DEEPSEEK_REASONING_EFFORT", "max")
+	} else {
+		payload["chat_template_kwargs"] = map[string]any{"thinking": thinking}
 	}
 	if req.MaxTokens != nil {
 		payload["max_tokens"] = *req.MaxTokens
@@ -79,8 +118,14 @@ func BuildPredictPayload(req ChatRequest) map[string]any {
 	if req.User != "" {
 		payload["user"] = req.User
 	}
+	if req.ReasoningEffort != "" {
+		payload["reasoning_effort"] = req.ReasoningEffort
+	}
 	if hasRawJSON(req.Stop) {
 		payload["stop"] = req.Stop
+	}
+	if hasRawJSON(req.StreamOptions) {
+		payload["stream_options"] = req.StreamOptions
 	}
 	if hasRawJSON(req.ResponseFormat) {
 		payload["response_format"] = req.ResponseFormat
@@ -173,12 +218,12 @@ func ToolCallsForStream(toolCalls []ToolCall) []ToolCall {
 	return out
 }
 
-func ConvertSSEToResponse(sseText string) *OpenAIResponse {
+func ConvertSSEToResponse(sseText string, modelID string) *OpenAIResponse {
 	resp := &OpenAIResponse{
 		ID:      "chatcmpl-" + RandomID(),
 		Object:  "chat.completion",
 		Created: CreatedTime(),
-		Model:   "moonshotai/kimi-k2.6",
+		Model:   modelID,
 		Choices: []OpenAIChoice{{Index: 0, Message: OpenAIMessage{Role: "assistant"}, FinishReason: strPtr("stop")}},
 	}
 
@@ -187,6 +232,7 @@ func ConvertSSEToResponse(sseText string) *OpenAIResponse {
 	}
 
 	var fullContent string
+	var fullReasoningContent string
 	var toolCalls []ToolCall
 	var finishReason *string
 
@@ -203,8 +249,9 @@ func ConvertSSEToResponse(sseText string) *OpenAIResponse {
 			Choices []struct {
 				FinishReason *string `json:"finish_reason"`
 				Delta        struct {
-					Content   string     `json:"content"`
-					ToolCalls []ToolCall `json:"tool_calls"`
+					Content          string     `json:"content"`
+					ReasoningContent string     `json:"reasoning_content"`
+					ToolCalls        []ToolCall `json:"tool_calls"`
 				} `json:"delta"`
 			} `json:"choices"`
 			Usage *Usage `json:"usage,omitempty"`
@@ -223,6 +270,7 @@ func ConvertSSEToResponse(sseText string) *OpenAIResponse {
 		}
 		delta := chunk.Choices[0].Delta
 		fullContent += delta.Content
+		fullReasoningContent += delta.ReasoningContent
 		for i, tc := range delta.ToolCalls {
 			toolCalls = mergeToolCall(toolCalls, tc, i)
 		}
@@ -230,6 +278,9 @@ func ConvertSSEToResponse(sseText string) *OpenAIResponse {
 
 	if fullContent != "" {
 		resp.Choices[0].Message.Content = fullContent
+	}
+	if fullReasoningContent != "" {
+		resp.Choices[0].Message.ReasoningContent = fullReasoningContent
 	}
 	if len(toolCalls) > 0 {
 		resp.Choices[0].Message.ToolCalls = toolCallsForMessage(toolCalls)
@@ -244,12 +295,12 @@ func ConvertSSEToResponse(sseText string) *OpenAIResponse {
 	return resp
 }
 
-func ConvertJSONToResponse(jsonBody string) *OpenAIResponse {
+func ConvertJSONToResponse(jsonBody string, modelID string) *OpenAIResponse {
 	var oaiResp OpenAIResponse
 	if err := json.Unmarshal([]byte(jsonBody), &oaiResp); err == nil && oaiResp.ID != "" {
 		return &oaiResp
 	}
-	return ConvertSSEToResponse(jsonBody)
+	return ConvertSSEToResponse(jsonBody, modelID)
 }
 
 func ConvertToStreamChunk(resp *OpenAIResponse) string {
@@ -263,8 +314,9 @@ func ConvertToStreamChunk(resp *OpenAIResponse) string {
 			"choices": []map[string]any{{
 				"index": i,
 				"delta": map[string]any{
-					"role":    "assistant",
-					"content": choice.Message.Content,
+					"role":              "assistant",
+					"content":           choice.Message.Content,
+					"reasoning_content": choice.Message.ReasoningContent,
 				},
 			}},
 		}

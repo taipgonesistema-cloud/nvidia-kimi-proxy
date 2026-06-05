@@ -6,6 +6,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 
 	"nvidia-proxy/internal/bridge"
 	"nvidia-proxy/internal/utils"
@@ -31,15 +33,20 @@ func (h *Handler) Models(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(204)
 		return
 	}
+	if !requireAPIKey(w, r) {
+		return
+	}
 
 	models := utils.ModelsResponse{
 		Object: "list",
-		Data: []utils.Model{{
-			ID:      "moonshotai/kimi-k2.6",
+	}
+	for _, cfg := range utils.ModelConfigs {
+		models.Data = append(models.Data, utils.Model{
+			ID:      cfg.ID,
 			Object:  "model",
 			Created: utils.CreatedTime(),
 			OwnedBy: "nvidia",
-		}},
+		})
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(models)
@@ -54,6 +61,9 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	if r.Method != "POST" {
 		writeError(w, 405, "Method not allowed, use POST")
+		return
+	}
+	if !requireAPIKey(w, r) {
 		return
 	}
 
@@ -73,18 +83,23 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 400, "messages is required")
 		return
 	}
+	model, ok := utils.ResolveModel(req.Model)
+	if !ok {
+		writeError(w, 400, fmt.Sprintf("unsupported model: %s", req.Model))
+		return
+	}
 
 	payload := utils.BuildPredictPayload(req)
 	jsonBody, _ := json.Marshal(payload)
 
-	respText, err := h.bridge.Predict(string(jsonBody))
+	respText, err := h.bridge.Predict(string(jsonBody), model)
 	if err != nil {
 		log.Printf("predict error: %v", err)
 		writeError(w, 502, fmt.Sprintf("predict failed: %v", err))
 		return
 	}
 
-	oaiResp := utils.ConvertJSONToResponse(respText)
+	oaiResp := utils.ConvertJSONToResponse(respText, model.ID)
 	if oaiResp == nil {
 		writeError(w, 502, "response parse error")
 		return
@@ -111,6 +126,7 @@ func (h *Handler) writeStream(w http.ResponseWriter, resp *utils.OpenAIResponse)
 
 	choice := resp.Choices[0]
 	content := choice.Message.Content
+	reasoningContent := choice.Message.ReasoningContent
 	toolCalls := choice.Message.ToolCalls
 
 	roleChunk := map[string]any{
@@ -127,6 +143,23 @@ func (h *Handler) writeStream(w http.ResponseWriter, resp *utils.OpenAIResponse)
 	data, _ := json.Marshal(roleChunk)
 	fmt.Fprintf(w, "data: %s\n\n", data)
 	flusher.Flush()
+
+	if reasoningContent != "" {
+		reasoningChunk := map[string]any{
+			"id":      resp.ID,
+			"object":  "chat.completion.chunk",
+			"created": resp.Created,
+			"model":   resp.Model,
+			"choices": []map[string]any{{
+				"index":         0,
+				"delta":         map[string]string{"reasoning_content": reasoningContent},
+				"finish_reason": nil,
+			}},
+		}
+		data, _ = json.Marshal(reasoningChunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
 
 	if len(toolCalls) > 0 {
 		toolChunk := map[string]any{
@@ -207,6 +240,22 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	json.NewEncoder(w).Encode(utils.ErrorResponse{
 		Error: utils.ErrorDetail{Message: msg, Type: "error", Code: fmt.Sprintf("%d", status)},
 	})
+}
+
+func requireAPIKey(w http.ResponseWriter, r *http.Request) bool {
+	apiKey := os.Getenv("API_KEY")
+	if apiKey == "" {
+		return true
+	}
+	authorization := r.Header.Get("Authorization")
+	if len(authorization) >= 7 && strings.EqualFold(authorization[:7], "Bearer ") && strings.TrimSpace(authorization[7:]) == apiKey {
+		return true
+	}
+	if r.Header.Get("X-API-Key") == apiKey {
+		return true
+	}
+	writeError(w, 401, "invalid or missing API key")
+	return false
 }
 
 func HealthCheck(w http.ResponseWriter, r *http.Request) {

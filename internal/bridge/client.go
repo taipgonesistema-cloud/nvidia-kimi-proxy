@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"nvidia-proxy/internal/utils"
 )
 
 type Client struct {
@@ -169,11 +171,11 @@ func (c *Client) SendChatMessage(text string) error {
 	return err
 }
 
-func (c *Client) Predict(bodyJSON string) (string, error) {
+func (c *Client) Predict(bodyJSON string, model utils.ModelConfig) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if err := c.preparePlayground(); err != nil {
+	if err := c.preparePlayground(model); err != nil {
 		return "", err
 	}
 	if err := c.networkStart("predict/models"); err != nil {
@@ -190,8 +192,8 @@ func (c *Client) Predict(bodyJSON string) (string, error) {
 	return c.waitForPredictBody(bodyJSON, 120*time.Second)
 }
 
-func (c *Client) preparePlayground() error {
-	const playgroundURL = "https://build.nvidia.com/moonshotai/kimi-k2.6/playground"
+func (c *Client) preparePlayground(model utils.ModelConfig) error {
+	playgroundURL := model.PlaygroundURL
 	script := fmt.Sprintf(`(function(){
 		if (!location.href.startsWith(%q)) location.href = %q;
 		return "ready";

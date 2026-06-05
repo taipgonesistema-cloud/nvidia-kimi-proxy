@@ -17,6 +17,8 @@ type ChatRequest struct {
 	Stop              json.RawMessage `json:"stop,omitempty"`
 	Seed              *int            `json:"seed,omitempty"`
 	User              string          `json:"user,omitempty"`
+	ReasoningEffort   string          `json:"reasoning_effort,omitempty"`
+	StreamOptions     json.RawMessage `json:"stream_options,omitempty"`
 }
 
 type ToolCall struct {
@@ -48,9 +50,10 @@ type OpenAIChoice struct {
 }
 
 type OpenAIMessage struct {
-	Role      string     `json:"role,omitempty"`
-	Content   string     `json:"content,omitempty"`
-	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	Role             string     `json:"role,omitempty"`
+	Content          string     `json:"content,omitempty"`
+	ReasoningContent string     `json:"reasoning_content,omitempty"`
+	ToolCalls        []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type Usage struct {
