@@ -71,7 +71,7 @@ type ModelConfig struct {
 var ModelConfigs = []ModelConfig{
 	{ID: "moonshotai/kimi-k2.6", PlaygroundURL: "https://build.nvidia.com/moonshotai/kimi-k2.6/playground"},
 	{ID: "deepseek-ai/deepseek-v4-pro", PlaygroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-pro/playground", ReasoningEffort: true},
-	{ID: "deepseek-ai/deepseek-v4-flash", PlaygroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-flash/playground", ReasoningEffort: true},
+	{ID: "deepseek-ai/deepseek-v4-flash", PlaygroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-flash/playground"},
 	{ID: "stepfun-ai/step-3.7-flash", PlaygroundURL: "https://build.nvidia.com/stepfun-ai/step-3.7-flash/playground"},
 }
 

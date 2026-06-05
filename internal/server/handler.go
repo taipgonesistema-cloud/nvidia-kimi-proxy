@@ -89,6 +89,11 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if req.Stream == nil {
+		req.Stream = new(bool)
+		*req.Stream = true
+	}
+
 	payload := utils.BuildPredictPayload(req)
 	jsonBody, _ := json.Marshal(payload)
 
@@ -105,7 +110,7 @@ func (h *Handler) ChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Stream {
+	if *req.Stream {
 		h.writeStream(w, oaiResp)
 	} else {
 		w.Header().Set("Content-Type", "application/json")

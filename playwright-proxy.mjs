@@ -22,7 +22,6 @@ const MODELS = {
   "deepseek-ai/deepseek-v4-flash": {
     id: "deepseek-ai/deepseek-v4-flash",
     playgroundURL: "https://build.nvidia.com/deepseek-ai/deepseek-v4-flash/playground",
-    reasoningEffort: true,
   },
   "stepfun-ai/step-3.7-flash": {
     id: "stepfun-ai/step-3.7-flash",
