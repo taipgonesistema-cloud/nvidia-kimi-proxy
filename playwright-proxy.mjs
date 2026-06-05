@@ -28,7 +28,8 @@ const MODELS = {
     playgroundURL: "https://build.nvidia.com/stepfun-ai/step-3.7-flash/playground",
   },
 };
-const PREDICT_ROUTE = "https://api.ngc.nvidia.com/v2/predict/models/**";
+const PREDICT_HOST = "api.ngc.nvidia.com";
+const PREDICT_PATH_PREFIX = "/v2/predict/models/";
 const PORT = Number(process.env.PORT || process.env.PLAYWRIGHT_PROXY_PORT || 4874);
 const USER_DATA_DIR = process.env.PLAYWRIGHT_USER_DATA_DIR || path.join(__dirname, "playwright-profile");
 const HEADLESS = ["1", "true", "yes"].includes(String(process.env.HEADLESS || "").toLowerCase());
@@ -37,21 +38,31 @@ const DEFAULT_MAX_TOKENS = Number(process.env.NVIDIA_MAX_TOKENS || 131072);
 const DEFAULT_TEMPERATURE = Number(process.env.NVIDIA_TEMPERATURE || 0.2);
 const DEFAULT_TOP_P = Number(process.env.NVIDIA_TOP_P || 0.8);
 const API_KEY = process.env.API_KEY || "";
+const ALLOW_UNAUTHENTICATED = parseBool(process.env.ALLOW_UNAUTHENTICATED, false);
 const DEFAULT_DEEPSEEK_REASONING_EFFORT = process.env.NVIDIA_DEEPSEEK_REASONING_EFFORT || "max";
 const BROWSER_IDLE_TIMEOUT_MS = Number(process.env.PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS || 300000);
+const MAX_PENDING_REQUESTS = Number(process.env.PLAYWRIGHT_MAX_PENDING_REQUESTS || 8);
+const MAX_CONCURRENT_REQUESTS = Number(process.env.PLAYWRIGHT_MAX_CONCURRENT_REQUESTS || 1);
 
 let context = null;
 let page = null;
-let currentPending = null;
-let lock = Promise.resolve();
 let lastRewrite = null;
 let browserInitPromise = null;
 let routeInstalled = false;
 let browserIdleTimer = null;
+let lastBrowserInitError = null;
+let workers = [];
+let workerQueue = [];
+let pendingByPage = new Map();
 
 function parseBool(value, fallback = false) {
   if (value === undefined || value === null || value === "") return fallback;
   return ["1", "true", "yes", "on"].includes(String(value).toLowerCase());
+}
+
+if (!API_KEY && !ALLOW_UNAUTHENTICATED && process.env.NODE_ENV === "production") {
+  console.error("[nvidia-playwright-proxy] API_KEY is required in production. Set ALLOW_UNAUTHENTICATED=true to disable auth intentionally.");
+  process.exit(1);
 }
 
 function profileHasState() {
@@ -117,11 +128,13 @@ function scheduleBrowserIdleClose() {
   if (browserIdleTimer) clearTimeout(browserIdleTimer);
   if (!BROWSER_IDLE_TIMEOUT_MS) return;
   browserIdleTimer = setTimeout(async () => {
-    if (currentPending) return scheduleBrowserIdleClose();
+    if (pendingByPage.size || workers.some((worker) => worker.busy) || workerQueue.length) return scheduleBrowserIdleClose();
     await context?.close().catch(() => {});
     context = null;
     page = null;
     routeInstalled = false;
+    workers = [];
+    pendingByPage = new Map();
   }, BROWSER_IDLE_TIMEOUT_MS);
 }
 
@@ -132,10 +145,67 @@ function keepBrowserAwake() {
   }
 }
 
-function withLock(fn) {
-  const run = lock.then(fn, fn);
-  lock = run.catch(() => {});
-  return run;
+function activeWorkerCount() {
+  return workers.filter((worker) => worker.busy).length;
+}
+
+function pendingRequestCount() {
+  return activeWorkerCount() + workerQueue.length;
+}
+
+function reserveQueueSlot() {
+  if (MAX_PENDING_REQUESTS > 0 && pendingRequestCount() >= MAX_PENDING_REQUESTS) {
+    const error = new Error("proxy busy: too many pending requests");
+    error.code = "PROXY_BUSY";
+    throw error;
+  }
+}
+
+async function createWorker() {
+  const workerPage = workers.length === 0 && page && !page.isClosed() ? page : await context.newPage();
+  workerPage.setDefaultTimeout(30000);
+  if (!page || page.isClosed()) page = workerPage;
+  const worker = { id: workers.length + 1, page: workerPage, busy: false, modelId: null };
+  workers.push(worker);
+  return worker;
+}
+
+async function acquireWorker() {
+  reserveQueueSlot();
+  keepBrowserAwake();
+  await ensureBrowser();
+
+  const idleWorker = workers.find((worker) => !worker.busy && !worker.page.isClosed());
+  if (idleWorker) {
+    idleWorker.busy = true;
+    return idleWorker;
+  }
+
+  if (workers.length < MAX_CONCURRENT_REQUESTS) {
+    const worker = await createWorker();
+    worker.busy = true;
+    return worker;
+  }
+
+  return new Promise((resolve, reject) => {
+    workerQueue.push({ resolve, reject });
+  });
+}
+
+function releaseWorker(worker) {
+  pendingByPage.delete(worker.page);
+  const next = workerQueue.shift();
+  if (next) {
+    worker.busy = true;
+    next.resolve(worker);
+    return;
+  }
+  worker.busy = false;
+  scheduleBrowserIdleClose();
+}
+
+function isPredictURL(url) {
+  return url.hostname === PREDICT_HOST && url.pathname.startsWith(PREDICT_PATH_PREFIX);
 }
 
 function randomID(prefix = "chatcmpl") {
@@ -164,7 +234,7 @@ function sendError(res, status, message) {
 }
 
 function requestHasValidAPIKey(req) {
-  if (!API_KEY) return true;
+  if (!API_KEY) return process.env.NODE_ENV !== "production" || ALLOW_UNAUTHENTICATED;
   const authorization = String(req.headers.authorization || "");
   const bearer = authorization.match(/^Bearer\s+(.+)$/i)?.[1];
   return bearer === API_KEY || req.headers["x-api-key"] === API_KEY;
@@ -243,11 +313,17 @@ function buildPredictPayload(req) {
     "tools",
     "tool_choice",
     "parallel_tool_calls",
-    "reasoning_effort",
     "stream_options",
   ];
   for (const field of copiedFields) {
     if (req[field] !== undefined && req[field] !== null) payload[field] = req[field];
+  }
+  if (modelInfo.reasoningEffort && req.reasoning_effort !== undefined && req.reasoning_effort !== null) {
+    payload.reasoning_effort = req.reasoning_effort;
+  }
+  if (req.max_completion_tokens !== undefined && req.max_completion_tokens !== null
+    && (req.max_tokens === undefined || req.max_tokens === null)) {
+    delete payload.max_tokens;
   }
   convertLegacyFunctions(req, payload);
   return { payload, modelInfo };
@@ -405,18 +481,134 @@ function sendOpenAIStream(res, response) {
   res.end("data: [DONE]\n\n");
 }
 
-async function ensureBrowser(modelInfo = MODELS[DEFAULT_MODEL]) {
+function requestHeadersForFetch(request) {
+  const headers = { ...request.headers() };
+  for (const header of ["host", "content-length", "connection", "accept-encoding"]) {
+    delete headers[header];
+  }
+  return headers;
+}
+
+function responseHeadersForFulfill(headers) {
+  const out = {};
+  headers.forEach((value, key) => {
+    if (!["content-encoding", "content-length", "transfer-encoding"].includes(key.toLowerCase())) {
+      out[key] = value;
+    }
+  });
+  return out;
+}
+
+function cleanDelta(delta) {
+  const out = {};
+  for (const [key, value] of Object.entries(delta || {})) {
+    if (value === null || value === undefined) continue;
+    if (Array.isArray(value) && value.length === 0) continue;
+    out[key] = value;
+  }
+  return out;
+}
+
+function createOpenAIStreamForwarder(res, modelId) {
+  const streamId = randomID();
+  const created = createdTime();
+  let buffer = "";
+  let started = false;
+  let sawDone = false;
+
+  const start = () => {
+    if (started) return;
+    started = true;
+    setCORS(res);
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    writeSSE(res, {
+      id: streamId,
+      object: "chat.completion.chunk",
+      created,
+      model: modelId,
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: null }],
+    });
+  };
+
+  const processLine = (rawLine) => {
+    const line = rawLine.trim();
+    if (!line.startsWith("data: ")) return;
+    const data = line.slice(6);
+    if (data === "[DONE]") {
+      sawDone = true;
+      return;
+    }
+
+    let chunk;
+    try {
+      chunk = JSON.parse(data);
+    } catch {
+      return;
+    }
+
+    start();
+    const out = {
+      id: streamId,
+      object: "chat.completion.chunk",
+      created,
+      model: modelId,
+      choices: Array.isArray(chunk.choices) ? chunk.choices.map((choice, index) => ({
+        index: Number.isInteger(choice.index) ? choice.index : index,
+        delta: cleanDelta(choice.delta || {}),
+        finish_reason: choice.finish_reason ?? null,
+      })) : [],
+    };
+    if (chunk.usage) out.usage = chunk.usage;
+    if (out.choices.length || out.usage) writeSSE(res, out);
+  };
+
+  return {
+    write(text) {
+      buffer += text;
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || "";
+      for (const line of lines) processLine(line);
+    },
+    end() {
+      if (buffer) processLine(buffer);
+      start();
+      if (!sawDone) {
+        writeSSE(res, {
+          id: streamId,
+          object: "chat.completion.chunk",
+          created,
+          model: modelId,
+          choices: [{ index: 0, delta: { content: "" }, finish_reason: "stop" }],
+        });
+      }
+      res.end("data: [DONE]\n\n");
+    },
+    fail(error) {
+      start();
+      writeSSE(res, { error: { message: error.message, type: "error" } });
+      res.end("data: [DONE]\n\n");
+    },
+  };
+}
+
+async function ensureBrowser() {
   keepBrowserAwake();
-  if (context && page && !page.isClosed() && page.url().startsWith(modelInfo.playgroundURL)) {
+  if (context && workers.some((worker) => !worker.page.isClosed())) {
     scheduleBrowserIdleClose();
     return;
   }
   if (browserInitPromise) return browserInitPromise;
 
   browserInitPromise = (async () => {
-    if (context && page && !page.isClosed()) {
-      await openPlayground(modelInfo, false);
-      return;
+    if (context) {
+      await context.close().catch(() => {});
+      context = null;
+      page = null;
+      workers = [];
+      pendingByPage = new Map();
     }
 
     const executablePath = findBrowserExecutable();
@@ -434,24 +626,29 @@ async function ensureBrowser(modelInfo = MODELS[DEFAULT_MODEL]) {
 
     page = context.pages()[0] || await context.newPage();
     page.setDefaultTimeout(30000);
+    workers = [{ id: 1, page, busy: false, modelId: null }];
     routeInstalled = false;
     if (!routeInstalled) {
       await context.route("**/*", handleRoute);
       routeInstalled = true;
     }
-    await openPlayground(modelInfo, false);
+    await openPlayground(page, MODELS[DEFAULT_MODEL], false);
     scheduleBrowserIdleClose();
   })();
 
   try {
     await browserInitPromise;
+    lastBrowserInitError = null;
+  } catch (error) {
+    lastBrowserInitError = error.message;
+    throw error;
   } finally {
     browserInitPromise = null;
   }
 }
 
-async function playgroundControlsReady() {
-  return page.evaluate(() => {
+async function playgroundControlsReady(targetPage) {
+  return targetPage.evaluate(() => {
     const input = document.querySelector('[data-testid="nv-text-area-element"]')
       || document.querySelector('.nv-text-area-element')
       || document.querySelector('textarea');
@@ -463,12 +660,12 @@ async function playgroundControlsReady() {
   }).catch(() => false);
 }
 
-async function waitForPlaygroundReady() {
-  await dismissCookieBanner();
-  await page.waitForFunction(() => document.readyState === "complete", null, { timeout: 60000 }).catch(() => {});
-  await dismissCookieBanner();
-  await page.waitForSelector('[data-testid="nv-text-area-element"], .nv-text-area-element, textarea', { timeout: 60000 });
-  await page.waitForFunction(() => {
+async function waitForPlaygroundReady(targetPage) {
+  await dismissCookieBanner(targetPage);
+  await targetPage.waitForFunction(() => document.readyState === "complete", null, { timeout: 60000 }).catch(() => {});
+  await dismissCookieBanner(targetPage);
+  await targetPage.waitForSelector('[data-testid="nv-text-area-element"], .nv-text-area-element, textarea', { timeout: 60000 });
+  await targetPage.waitForFunction(() => {
     const input = document.querySelector('[data-testid="nv-text-area-element"]')
       || document.querySelector('.nv-text-area-element')
       || document.querySelector('textarea');
@@ -478,24 +675,28 @@ async function waitForPlaygroundReady() {
       && !!(input.offsetWidth || input.offsetHeight || input.getClientRects().length)
       && !!(send.offsetWidth || send.offsetHeight || send.getClientRects().length);
   }, null, { timeout: 60000 });
-  await dismissCookieBanner();
+  await dismissCookieBanner(targetPage);
 }
 
-async function openPlayground(modelInfo, forceReload) {
-  if (forceReload || !page.url().startsWith(modelInfo.playgroundURL)) {
-    await page.goto(modelInfo.playgroundURL, { waitUntil: "load", timeout: 90000 });
+async function openPlayground(targetPage, modelInfo, forceReload) {
+  if (forceReload || !targetPage.url().startsWith(modelInfo.playgroundURL)) {
+    await targetPage.goto(modelInfo.playgroundURL, { waitUntil: "load", timeout: 90000 });
   }
-  await waitForPlaygroundReady();
+  await waitForPlaygroundReady(targetPage);
 }
 
-async function preparePlayground(modelInfo) {
-  await ensureBrowser(modelInfo);
-  if (!page.url().startsWith(modelInfo.playgroundURL)) {
-    await openPlayground(modelInfo, true);
+async function prepareWorker(worker, modelInfo) {
+  if (!worker.page.url().startsWith(modelInfo.playgroundURL)) {
+    await openPlayground(worker.page, modelInfo, true);
+    worker.modelId = modelInfo.id;
     return;
   }
-  if (await playgroundControlsReady()) return;
-  await waitForPlaygroundReady();
+  if (await playgroundControlsReady(worker.page)) {
+    worker.modelId = modelInfo.id;
+    return;
+  }
+  await waitForPlaygroundReady(worker.page);
+  worker.modelId = modelInfo.id;
 }
 
 async function handleRoute(route) {
@@ -504,7 +705,7 @@ async function handleRoute(route) {
   const host = url.hostname;
   const resourceType = request.resourceType();
 
-  if (!request.url().includes("/v2/predict/models/")) {
+  if (!isPredictURL(url)) {
     if (["image", "media", "font"].includes(resourceType)
       || host.includes("google-analytics")
       || host.includes("googletagmanager")
@@ -519,20 +720,30 @@ async function handleRoute(route) {
     return;
   }
 
-  if (request.method() !== "POST" || !request.url().includes("/v2/predict/models/")) {
+  if (request.method() !== "POST") {
     await route.continue();
     return;
   }
 
-  const pending = currentPending;
+  let requestPage = null;
+  try {
+    requestPage = request.frame().page();
+  } catch {}
+
+  const pending = requestPage ? pendingByPage.get(requestPage) : null;
   if (!pending) {
     await route.continue();
     return;
   }
 
+  const originalPostData = request.postData() || "";
+  if (pending.triggerText && !originalPostData.includes(pending.triggerText)) {
+    await route.abort().catch(() => {});
+    return;
+  }
   pending.request = request;
   pending.url = request.url();
-  pending.originalPostData = request.postData() || "";
+  pending.originalPostData = originalPostData;
   const originalSummary = payloadSummary(pending.originalPostData);
   const rewrittenSummary = payloadSummary(pending.postData);
   lastRewrite = {
@@ -554,19 +765,67 @@ async function handleRoute(route) {
     rewrittenLength: pending.postData.length,
     at: Date.now(),
   };
+  let timeout = null;
   try {
-    const response = await route.fetch({ postData: pending.postData, timeout: REQUEST_TIMEOUT_MS });
-    const body = await response.text();
-    await route.fulfill({ response, body });
+    const controller = new AbortController();
+    timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    const upstream = await fetch(request.url(), {
+      method: request.method(),
+      headers: requestHeadersForFetch(request),
+      body: pending.postData,
+      signal: controller.signal,
+    });
+
+    if (upstream.status < 200 || upstream.status >= 300) {
+      const body = await upstream.text();
+      await route.fulfill({
+        status: upstream.status,
+        headers: responseHeadersForFulfill(upstream.headers),
+        body,
+      });
+      pending.resolve({
+        status: upstream.status,
+        url: pending.url,
+        mimeType: upstream.headers.get("content-type") || "",
+        body,
+      });
+      return;
+    }
+
+    const bodyChunks = [];
+    const decoder = new TextDecoder();
+    const reader = upstream.body?.getReader();
+    if (reader) {
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        bodyChunks.push(Buffer.from(value));
+        if (pending.streamForwarder) {
+          pending.streamForwarder.write(decoder.decode(value, { stream: true }));
+        }
+      }
+      const tail = decoder.decode();
+      if (tail && pending.streamForwarder) pending.streamForwarder.write(tail);
+    }
+    const body = Buffer.concat(bodyChunks).toString("utf8");
+    if (pending.streamForwarder) pending.streamForwarder.end();
+    await route.fulfill({
+      status: upstream.status,
+      headers: responseHeadersForFulfill(upstream.headers),
+      body,
+    });
     pending.resolve({
-      status: response.status(),
+      status: upstream.status,
       url: pending.url,
-      mimeType: response.headers()["content-type"] || "",
+      mimeType: upstream.headers.get("content-type") || "",
       body,
     });
   } catch (error) {
+    if (pending.streamForwarder && !pending.streamResponse?.writableEnded) pending.streamForwarder.fail(error);
     await route.abort().catch(() => {});
     pending.reject(error);
+  } finally {
+    if (timeout) clearTimeout(timeout);
   }
 }
 
@@ -593,8 +852,8 @@ function payloadSummary(postData) {
   }
 }
 
-async function elementCenter(selectorExpression) {
-  return page.evaluate((expression) => {
+async function elementCenter(targetPage, selectorExpression) {
+  return targetPage.evaluate((expression) => {
     const element = Function(`return (${expression});`)();
     if (!element) return null;
     const rect = element.getBoundingClientRect();
@@ -678,9 +937,9 @@ async function cdpClearTextarea(cdp) {
   }
 }
 
-async function sendButtonEnabled(timeout = 3000) {
+async function sendButtonEnabled(targetPage, timeout = 3000) {
   try {
-    await page.waitForFunction(() => {
+    await targetPage.waitForFunction(() => {
       const button = [...document.querySelectorAll("button")].find((item) => item.getAttribute("aria-label") === "Send");
       return button && !button.disabled;
     }, null, { timeout });
@@ -690,15 +949,15 @@ async function sendButtonEnabled(timeout = 3000) {
   }
 }
 
-async function dismissCookieBanner() {
+async function dismissCookieBanner(targetPage) {
   const clickButton = async (selector, text) => {
     try {
       if (selector) {
-        const el = await page.$(selector);
+        const el = await targetPage.$(selector);
         if (el) { await el.click().catch(() => {}); return true; }
       }
       if (text) {
-        await page.evaluate((t) => {
+        await targetPage.evaluate((t) => {
           const btn = [...document.querySelectorAll("button")].find(
             b => (b.innerText || b.textContent || "").trim() === t
           );
@@ -711,10 +970,10 @@ async function dismissCookieBanner() {
   };
 
   await clickButton("#onetrust-accept-btn-handler", "Accept All");
-  await page.waitForTimeout(2000);
+  await targetPage.waitForTimeout(2000);
 
   await clickButton(null, "Acknowledge & Continue");
-  await page.waitForTimeout(1000);
+  await targetPage.waitForTimeout(1000);
 }
 
 async function cdpClickSendFallback(cdp) {
@@ -734,32 +993,33 @@ async function cdpClickSendFallback(cdp) {
   }
 }
 
-async function triggerPlaygroundRequest() {
-  await page.bringToFront();
-  const cdp = await context.newCDPSession(page);
-  const triggerText = `bridge trigger ${Date.now()}`;
+async function triggerPlaygroundRequest(worker, triggerText) {
+  const targetPage = worker.page;
+  await targetPage.bringToFront();
+  const cdp = await context.newCDPSession(targetPage);
 
   for (let attempt = 1; attempt <= 3; attempt++) {
-    const inputPoint = await elementCenter(`document.querySelector('[data-testid="nv-text-area-element"]') || document.querySelector('.nv-text-area-element') || document.querySelector('textarea')`);
+    const inputPoint = await elementCenter(targetPage, `document.querySelector('[data-testid="nv-text-area-element"]') || document.querySelector('.nv-text-area-element') || document.querySelector('textarea')`);
     if (!inputPoint) throw new Error("textarea not found");
 
     await cdpClick(cdp, inputPoint);
     await cdpClearTextarea(cdp);
     await cdp.send("Input.insertText", { text: triggerText }).catch(() => {});
-    if (await sendButtonEnabled()) break;
+    if (await sendButtonEnabled(targetPage)) break;
 
     await cdpSetTextareaValue(cdp, triggerText);
-    if (await sendButtonEnabled()) break;
+    if (await sendButtonEnabled(targetPage)) break;
 
     if (attempt === 3) throw new Error("send button did not enable after CDP input");
-    await page.waitForTimeout(500);
+    await targetPage.waitForTimeout(500);
   }
 
-  const sendPoint = await elementCenter(`[...document.querySelectorAll('button')].find((item) => item.getAttribute('aria-label') === 'Send')`);
+  const sendPoint = await elementCenter(targetPage, `[...document.querySelectorAll('button')].find((item) => item.getAttribute('aria-label') === 'Send')`);
   if (!sendPoint) throw new Error("send button not found");
   await cdpClick(cdp, sendPoint);
   await new Promise((resolve) => setTimeout(resolve, 750));
-  if (currentPending && !currentPending.request) await cdpClickSendFallback(cdp);
+  const pending = pendingByPage.get(targetPage);
+  if (pending && !pending.request) await cdpClickSendFallback(cdp);
 }
 
 async function pageDebugState() {
@@ -804,24 +1064,30 @@ async function pageDebugState() {
   });
 }
 
-async function predict(postData, modelInfo) {
-  return withLock(async () => {
-    await preparePlayground(modelInfo);
+async function predict(postData, modelInfo, options = {}) {
+  const worker = await acquireWorker();
+  try {
+    await prepareWorker(worker, modelInfo);
 
     const pending = {};
+    const pendingId = randomID("predict");
+    const triggerText = `bridge trigger ${pendingId}`;
     const responsePromise = new Promise((resolve, reject) => {
       Object.assign(pending, {
-        id: randomID("predict"),
+        id: pendingId,
         postData,
+        triggerText,
         request: null,
+        streamForwarder: options.streamResponse ? createOpenAIStreamForwarder(options.streamResponse, modelInfo.id) : null,
+        streamResponse: options.streamResponse || null,
         resolve,
         reject,
       });
     });
 
-    currentPending = pending;
+    pendingByPage.set(worker.page, pending);
     try {
-      await triggerPlaygroundRequest();
+      await triggerPlaygroundRequest(worker, pending.triggerText);
       const timeoutPromise = new Promise((_, reject) => {
         setTimeout(() => reject(new Error("predict timed out waiting for NVIDIA response")), REQUEST_TIMEOUT_MS);
       });
@@ -833,11 +1099,31 @@ async function predict(postData, modelInfo) {
         throw new Error("predict response did not finish with data: [DONE]");
       }
       return response.body;
-    } finally {
-      currentPending = null;
-      scheduleBrowserIdleClose();
+    } catch (error) {
+      pendingByPage.delete(worker.page);
+      await openPlayground(worker.page, modelInfo, true).catch(() => {});
+      throw error;
     }
-  });
+  } finally {
+    releaseWorker(worker);
+  }
+}
+
+function healthStatus() {
+  const browserReady = !!(context && page && !page.isClosed());
+  const pending = [...pendingByPage.values()].map((item) => ({ id: item.id, matched: !!item.request }));
+  return {
+    service: "nvidia-playwright-proxy",
+    status: lastBrowserInitError ? "degraded" : "ok",
+    port: PORT,
+    browserReady,
+    pageURL: browserReady ? page.url() : null,
+    workers: workers.map((worker) => ({ id: worker.id, busy: worker.busy, model: worker.modelId, pageURL: worker.page.isClosed() ? null : worker.page.url() })),
+    pending,
+    queued: workerQueue.length,
+    active: activeWorkerCount(),
+    lastBrowserInitError,
+  };
 }
 
 async function chatCompletions(req, res) {
@@ -867,11 +1153,13 @@ async function chatCompletions(req, res) {
   }
 
   try {
-    const sseText = await predict(JSON.stringify(payload), modelInfo);
-    const openAIResponse = convertSSEToResponse(sseText, modelInfo.id);
-    if (chatReq.stream) sendOpenAIStream(res, openAIResponse);
-    else sendJSON(res, 200, openAIResponse);
+    const sseText = await predict(JSON.stringify(payload), modelInfo, chatReq.stream ? { streamResponse: res } : {});
+    if (!chatReq.stream) {
+      const openAIResponse = convertSSEToResponse(sseText, modelInfo.id);
+      sendJSON(res, 200, openAIResponse);
+    }
   } catch (error) {
+    if (res.headersSent || res.writableEnded) return;
     sendError(res, 502, `predict failed: ${error.message}`);
   }
 }
@@ -889,13 +1177,17 @@ const server = http.createServer(async (req, res) => {
     sendJSON(res, 200, { service: "nvidia-playwright-proxy", status: "running", port: PORT });
     return;
   }
+  if (req.method === "GET" && url.pathname === "/healthz") {
+    const health = healthStatus();
+    sendJSON(res, health.lastBrowserInitError ? 503 : 200, health);
+    return;
+  }
   if (req.method === "GET" && url.pathname === "/debug/status") {
     if (!requireAPIKey(req, res)) return;
+    const health = healthStatus();
     sendJSON(res, 200, {
-      service: "nvidia-playwright-proxy",
-      browserReady: !!context,
+      ...health,
       pageURL: page && !page.isClosed() ? page.url() : null,
-      pending: currentPending ? { id: currentPending.id, matched: !!currentPending.request } : null,
       lastRewrite,
       userDataDir: USER_DATA_DIR,
       headless: HEADLESS,
@@ -935,10 +1227,18 @@ const server = http.createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`[nvidia-playwright-proxy] listening on http://localhost:${PORT}`);
-  ensureBrowser().catch((error) => console.error(`[nvidia-playwright-proxy] browser init failed: ${error.message}`));
+  ensureBrowser().catch((error) => {
+    lastBrowserInitError = error.message;
+    console.error(`[nvidia-playwright-proxy] browser init failed: ${error.message}`);
+  });
 });
 
-process.on("SIGINT", async () => {
+async function shutdown(signal) {
+  console.log(`[nvidia-playwright-proxy] ${signal} received, shutting down`);
+  await new Promise((resolve) => server.close(resolve));
   await context?.close().catch(() => {});
   process.exit(0);
-});
+}
+
+process.once("SIGINT", () => shutdown("SIGINT"));
+process.once("SIGTERM", () => shutdown("SIGTERM"));

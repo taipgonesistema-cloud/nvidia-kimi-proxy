@@ -22,11 +22,13 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev
 
 COPY playwright-proxy.mjs ./
+RUN mkdir -p /app/profile && chown -R node:node /app
+USER node
 
 EXPOSE 4874
 VOLUME ["/app/profile"]
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD curl -fsS http://localhost:${PORT}/ >/dev/null || exit 1
+  CMD curl -fsS http://localhost:${PORT}/healthz >/dev/null || exit 1
 
 CMD ["node", "playwright-proxy.mjs"]

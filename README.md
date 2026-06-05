@@ -14,7 +14,7 @@
 
 Proxy OpenAI-compatible para modelos do NVIDIA Build Playground. Ele usa Playwright + Chromium com perfil persistente, abre o playground real da NVIDIA, dispara uma requisição legítima no navegador e intercepta o request `/v2/predict/models/*` para substituir o payload pelo formato recebido em `/v1/chat/completions`.
 
-Suporta chat, streaming, tool calling, API key local e `reasoning_content` quando o modelo da NVIDIA retorna thinking/reasoning.
+Suporta chat, streaming OpenAI-compatible com repasse upstream incremental, tool calling, API key local e `reasoning_content` quando o modelo da NVIDIA retorna thinking/reasoning.
 
 ## Modelos
 
@@ -24,7 +24,7 @@ Disponíveis em `GET /v1/models`:
 |---|---:|---|
 | `moonshotai/kimi-k2.6` | Não validado | Modelo padrão |
 | `deepseek-ai/deepseek-v4-pro` | Sim | Envia `reasoning_effort=max` por padrão e retorna `reasoning_content` |
-| `deepseek-ai/deepseek-v4-flash` | Sim | Envia `reasoning_effort=max` por padrão e retorna `reasoning_content` |
+| `deepseek-ai/deepseek-v4-flash` | Não por padrão | Não envia `reasoning_effort`; `reasoning_effort` do cliente é ignorado para manter baixa latência |
 | `stepfun-ai/step-3.7-flash` | Sim | Retorna `reasoning_content` quando a NVIDIA envia |
 
 ## Requisitos
@@ -42,6 +42,7 @@ Copie `.env.example` para `.env` e ajuste:
 PORT=4874
 HOST_PORT=4874
 API_KEY=dummy
+ALLOW_UNAUTHENTICATED=false
 HEADLESS=true
 NVIDIA_THINKING=false
 NVIDIA_MAX_TOKENS=131072
@@ -53,6 +54,8 @@ PLAYWRIGHT_USER_DATA_DIR=
 PLAYWRIGHT_CHROME=
 PLAYWRIGHT_CHROMIUM_ARGS=
 PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS=60000
+PLAYWRIGHT_MAX_PENDING_REQUESTS=8
+PLAYWRIGHT_MAX_CONCURRENT_REQUESTS=1
 ```
 
 Variáveis principais:
@@ -61,18 +64,21 @@ Variáveis principais:
 |---|---|---|
 | `PORT` | `4874` | Porta HTTP dentro do processo/container |
 | `HOST_PORT` | `4874` | Porta publicada no host pelo Docker Compose |
-| `API_KEY` | vazio | Se definido, exige `Authorization: Bearer <API_KEY>` ou `X-API-Key` em `/v1/*` e `/debug/*` |
+| `API_KEY` | vazio | Se definido, exige `Authorization: Bearer <API_KEY>` ou `X-API-Key` em `/v1/*` e `/debug/*`. Em `NODE_ENV=production`, é obrigatório salvo se `ALLOW_UNAUTHENTICATED=true` |
+| `ALLOW_UNAUTHENTICATED` | `false` | Permite rodar sem `API_KEY`. Use apenas em local/dev ou rede privada |
 | `HEADLESS` | `false` local, `true` Docker | Roda Chromium oculto |
 | `NVIDIA_THINKING` | `false` | Enviado em `chat_template_kwargs.thinking` para modelos que usam esse campo. Não é injetado nos DeepSeek V4 |
 | `NVIDIA_MAX_TOKENS` | `131072` | `max_tokens` padrão quando o cliente não envia |
 | `NVIDIA_TEMPERATURE` | `0.2` | `temperature` padrão quando o cliente não envia |
 | `NVIDIA_TOP_P` | `0.8` | `top_p` padrão quando o cliente não envia |
-| `NVIDIA_DEEPSEEK_REASONING_EFFORT` | `max` | `reasoning_effort` padrão dos modelos DeepSeek V4 |
+| `NVIDIA_DEEPSEEK_REASONING_EFFORT` | `max` | `reasoning_effort` padrão do DeepSeek V4 Pro |
 | `NVIDIA_REQUEST_TIMEOUT_MS` | `120000` | Timeout máximo por requisição |
 | `PLAYWRIGHT_USER_DATA_DIR` | `./playwright-profile` | Diretório persistente do Chromium |
 | `PLAYWRIGHT_CHROME` | auto-detecção | Caminho do Chrome/Edge/Chromium |
 | `PLAYWRIGHT_CHROMIUM_ARGS` | vazio local | Flags extras do Chromium. No Docker use `--no-sandbox --disable-dev-shm-usage` |
 | `PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS` | `60000` no Docker, `300000` local | Fecha o Chromium após esse tempo ocioso para reduzir CPU/RAM. Use `0` para manter sempre aberto |
+| `PLAYWRIGHT_MAX_PENDING_REQUESTS` | `8` | Limite total de chamadas ativas + fila. Ao exceder, retorna erro de proxy ocupado |
+| `PLAYWRIGHT_MAX_CONCURRENT_REQUESTS` | `1` local, `2` no Compose | Número máximo de páginas Playwright trabalhando em paralelo |
 
 ## Execução Local
 
@@ -190,6 +196,7 @@ PLAYWRIGHT_USER_DATA_DIR=/app/profile
 PLAYWRIGHT_CHROME=/usr/bin/chromium
 PLAYWRIGHT_CHROMIUM_ARGS=--no-sandbox --disable-dev-shm-usage --single-process
 PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS=60000
+PLAYWRIGHT_MAX_CONCURRENT_REQUESTS=2
 ```
 
 Configure volume persistente em:
@@ -313,7 +320,7 @@ data: {"choices":[{"delta":{"reasoning_content":"..."}}]}
 data: {"choices":[{"delta":{"content":"ok"}}]}
 ```
 
-No DeepSeek V4 Pro e V4 Flash, o payload enviado inclui por padrão:
+No DeepSeek V4 Pro, o payload enviado inclui por padrão:
 
 ```json
 {
@@ -331,9 +338,11 @@ Você pode sobrescrever por request:
 }
 ```
 
+No DeepSeek V4 Flash, o proxy não envia `reasoning_effort` e ignora esse campo mesmo se o cliente mandar. Isso reduz latência e evita timeouts comuns no Flash.
+
 ## Debug
 
-Endpoints protegidos por `API_KEY` quando configurada:
+Endpoints protegidos por `API_KEY` quando auth está ativo:
 
 ```bash
 curl http://localhost:4874/debug/status \
@@ -403,7 +412,7 @@ Exemplo de provider em `~/.pi/agent/models.json`:
         {
           "id": "deepseek-ai/deepseek-v4-pro",
           "name": "NVIDIA DeepSeek V4 Pro",
-          "reasoning": true,
+          "reasoning": false,
           "input": ["text"],
           "contextWindow": 1000000,
           "maxTokens": 131072,
@@ -455,7 +464,7 @@ nvidia-kimi-proxy/
 ## Notas
 
 - Não commite `.env` nem perfis Chromium. Eles ficam ignorados por `.gitignore`.
-- O healthcheck usa `GET /`, que não exige `API_KEY`.
+- O healthcheck usa `GET /healthz`, que não exige `API_KEY` e falha se a inicialização do Chromium falhar.
 - Em Windows, `curl` pode falhar em HTTPS público com `CRYPT_E_NO_REVOCATION_CHECK`; para teste local do deploy foi usado `curl -k`.
 - O Dockerfile foi feito para Linux container com `/usr/bin/chromium`.
 

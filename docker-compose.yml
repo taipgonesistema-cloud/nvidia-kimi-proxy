@@ -8,6 +8,7 @@ services:
     environment:
       PORT: "4874"
       API_KEY: "${API_KEY:-}"
+      ALLOW_UNAUTHENTICATED: "${ALLOW_UNAUTHENTICATED:-false}"
       HEADLESS: "true"
       NVIDIA_THINKING: "${NVIDIA_THINKING:-false}"
       NVIDIA_MAX_TOKENS: "${NVIDIA_MAX_TOKENS:-131072}"
@@ -19,6 +20,8 @@ services:
       PLAYWRIGHT_USER_DATA_DIR: "/app/profile"
       PLAYWRIGHT_CHROMIUM_ARGS: "--no-sandbox --disable-dev-shm-usage --single-process"
       PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS: "${PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS:-60000}"
+      PLAYWRIGHT_MAX_PENDING_REQUESTS: "${PLAYWRIGHT_MAX_PENDING_REQUESTS:-8}"
+      PLAYWRIGHT_MAX_CONCURRENT_REQUESTS: "${PLAYWRIGHT_MAX_CONCURRENT_REQUESTS:-2}"
     volumes:
       - nvidia-kimi-profile:/app/profile
 
