@@ -2,242 +2,134 @@
   <img src="https://raw.githubusercontent.com/MoonshotAI/Kimi-K2/main/figures/kimi-logo.png" alt="Kimi K2.6" width="120"/>
 </p>
 
-# NVIDIA Kimi K2.6 Proxy
+# NVIDIA Playground Proxy
 
 <p align="center">
   <img src="https://img.shields.io/badge/Node.js-20+-339933?logo=node.js&logoColor=white" alt="Node.js"/>
   <img src="https://img.shields.io/badge/Playwright-1.57+-45ba4b?logo=playwright&logoColor=white" alt="Playwright"/>
   <img src="https://img.shields.io/badge/Chromium-powered-blue?logo=googlechrome&logoColor=white" alt="Chromium"/>
   <img src="https://img.shields.io/badge/OpenAI-Compatible-black?logo=openai&logoColor=white" alt="OpenAI Compatible"/>
+  <img src="https://img.shields.io/badge/Docker-ready-2496ed?logo=docker&logoColor=white" alt="Docker Ready"/>
 </p>
 
-Proxy compatível com OpenAI que redireciona requisições para o modelo `moonshotai/kimi-k2.6` no playground da NVIDIA, usando Playwright + Chromium para autenticação via sessão do navegador.
+Proxy OpenAI-compatible para modelos do NVIDIA Build Playground. Ele usa Playwright + Chromium com perfil persistente, abre o playground real da NVIDIA, dispara uma requisição legítima no navegador e intercepta o request `/v2/predict/models/*` para substituir o payload pelo formato recebido em `/v1/chat/completions`.
 
-Suporta **tool calling**, **streaming** e integração direta com o [pi.dev](https://pi.dev).
+Suporta chat, streaming, tool calling, API key local e `reasoning_content` quando o modelo da NVIDIA retorna thinking/reasoning.
 
-## Pré-requisitos
+## Modelos
 
-- **Node.js** 18+ (com `npm`)
-- **Google Chrome** ou **Microsoft Edge** instalado
-- **Docker** opcional, para rodar em container
-- Conexão com internet
+Disponíveis em `GET /v1/models`:
 
-## Instalação
+| Modelo | Reasoning | Observações |
+|---|---:|---|
+| `moonshotai/kimi-k2.6` | Não validado | Modelo padrão |
+| `deepseek-ai/deepseek-v4-pro` | Sim | Envia `reasoning_effort=max` por padrão e retorna `reasoning_content` |
+| `stepfun-ai/step-3.7-flash` | Sim | Retorna `reasoning_content` quando a NVIDIA envia |
 
-```bash
-# 1. Clone o repositório
-git clone https://github.com/taipgonesistema-cloud/nvidia-kimi-proxy
-cd nvidia-kimi-proxy
+## Requisitos
 
-# 2. Instale as dependências
-npm install
-
-# 3. Copie e configure o .env
-cp .env.example .env
-# Edite o .env conforme necessário (PORT, HEADLESS, etc.)
-
-# 4. Inicie o proxy em modo visível (primeira execução)
-node playwright-proxy.mjs
-```
-
-O navegador abrirá sozinho na página do playground da NVIDIA.
-
-### Primeira execução — aceitar os termos
-
-Na primeira vez, execute no **modo visível** (`HEADLESS=false`). O proxy automaticamente aceita os termos e salva no perfil do navegador.
-
-Após isso, pode usar `HEADLESS=true` nas próximas execuções.
+- Node.js 18+ para execução local
+- Chrome, Edge ou Chromium instalado para execução local
+- Docker opcional para container/EasyPanel
+- Acesso de rede ao `build.nvidia.com` e `api.ngc.nvidia.com`
 
 ## Configuração
 
-O proxy carrega automaticamente as variáveis do arquivo `.env` (via dotenv).
-Copie o `.env.example` para `.env` e ajuste:
+Copie `.env.example` para `.env` e ajuste:
 
 ```env
-PORT=4874              # Porta do proxy
-API_KEY=               # Opcional: exige Authorization: Bearer <API_KEY>
-HEADLESS=false         # true para Chromium oculto
-NVIDIA_THINKING=false  # Habilita raciocínio do modelo
+PORT=4874
+HOST_PORT=4874
+API_KEY=dummy
+HEADLESS=true
+NVIDIA_THINKING=false
 NVIDIA_MAX_TOKENS=131072
-NVIDIA_TEMPERATURE=0.2 # Mais baixo = respostas mais determinísticas
-NVIDIA_TOP_P=0.8       # Limita amostragem para reduzir deriva/alucinação
+NVIDIA_TEMPERATURE=0.2
+NVIDIA_TOP_P=0.8
 NVIDIA_DEEPSEEK_REASONING_EFFORT=max
+NVIDIA_REQUEST_TIMEOUT_MS=120000
+PLAYWRIGHT_USER_DATA_DIR=
+PLAYWRIGHT_CHROME=
 ```
 
-## Uso
+Variáveis principais:
 
-### Modo visível (testes)
+| Variável | Padrão | Descrição |
+|---|---|---|
+| `PORT` | `4874` | Porta HTTP dentro do processo/container |
+| `HOST_PORT` | `4874` | Porta publicada no host pelo Docker Compose |
+| `API_KEY` | vazio | Se definido, exige `Authorization: Bearer <API_KEY>` ou `X-API-Key` em `/v1/*` e `/debug/*` |
+| `HEADLESS` | `false` local, `true` Docker | Roda Chromium oculto |
+| `NVIDIA_THINKING` | `false` | Enviado em `chat_template_kwargs.thinking` para modelos que usam esse campo. Não é injetado no DeepSeek V4 Pro |
+| `NVIDIA_MAX_TOKENS` | `131072` | `max_tokens` padrão quando o cliente não envia |
+| `NVIDIA_TEMPERATURE` | `0.2` | `temperature` padrão quando o cliente não envia |
+| `NVIDIA_TOP_P` | `0.8` | `top_p` padrão quando o cliente não envia |
+| `NVIDIA_DEEPSEEK_REASONING_EFFORT` | `max` | `reasoning_effort` padrão do `deepseek-ai/deepseek-v4-pro` |
+| `NVIDIA_REQUEST_TIMEOUT_MS` | `120000` | Timeout máximo por requisição |
+| `PLAYWRIGHT_USER_DATA_DIR` | `./playwright-profile` | Diretório persistente do Chromium |
+| `PLAYWRIGHT_CHROME` | auto-detecção | Caminho do Chrome/Edge/Chromium |
+| `PLAYWRIGHT_CHROMIUM_ARGS` | vazio local | Flags extras do Chromium. No Docker use `--no-sandbox --disable-dev-shm-usage` |
+
+## Execução Local
+
+Instale dependências:
+
+```bash
+npm install
+```
+
+Modo visível para debug:
+
+```env
+HEADLESS=false
+PORT=4874
+```
 
 ```bash
 node playwright-proxy.mjs
 ```
 
-### Modo headless (produção)
-
-Após já ter aceito os termos uma vez no modo visível, edite o `.env`:
+Modo headless local:
 
 ```env
 HEADLESS=true
 PORT=4874
 ```
 
-E inicie:
-
 ```bash
 node playwright-proxy.mjs
 ```
 
-## Endpoint
+Também existem atalhos Windows:
 
+```bat
+run-playwright-proxy.bat
+run-playwright-proxy-headless.bat
 ```
-http://localhost:4874/v1/chat/completions
-```
-
-(ou a porta definida no `.env`)
-
-Modelos disponíveis em `/v1/models`:
-
-- `moonshotai/kimi-k2.6`
-- `deepseek-ai/deepseek-v4-pro`
-- `stepfun-ai/step-3.7-flash`
-
-### Exemplo com curl
-
-```bash
-curl http://localhost:4874/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "moonshotai/kimi-k2.6",
-    "messages": [{"role": "user", "content": "Olá, tudo bem?"}],
-    "max_tokens": 100
-  }'
-```
-
-### Exemplo com tool calling
-
-```bash
-curl http://localhost:4874/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "moonshotai/kimi-k2.6",
-    "messages": [{"role": "user", "content": "Qual a temperatura em Paris?"}],
-    "tools": [
-      {
-        "type": "function",
-        "function": {
-          "name": "get_weather",
-          "description": "Obtém a temperatura de uma cidade",
-          "parameters": {
-            "type": "object",
-            "properties": {
-              "city": { "type": "string" }
-            },
-            "required": ["city"]
-          }
-        }
-      }
-    ],
-    "tool_choice": "auto",
-    "max_tokens": 200
-  }'
-```
-
-## Variáveis de Ambiente
-
-| Variável | Padrão | Descrição |
-|---|---|---|
-| `PORT` | `4874` | Porta do servidor proxy |
-| `HOST_PORT` | `4874` | Porta publicada no host pelo `docker-compose.yml` |
-| `API_KEY` | vazio | Se definido, exige `Authorization: Bearer <API_KEY>` ou `X-API-Key` nos endpoints `/v1/*` e `/debug/*` |
-| `HEADLESS` | `false` | `true` para rodar o Chromium em modo oculto |
-| `NVIDIA_THINKING` | `false` | Habilita raciocínio (thinking) do modelo |
-| `NVIDIA_MAX_TOKENS` | `131072` | `max_tokens` padrão quando o cliente não envia |
-| `NVIDIA_TEMPERATURE` | `0.2` | `temperature` padrão quando o cliente não envia |
-| `NVIDIA_TOP_P` | `0.8` | `top_p` padrão quando o cliente não envia |
-| `NVIDIA_DEEPSEEK_REASONING_EFFORT` | `max` | `reasoning_effort` padrão para `deepseek-ai/deepseek-v4-pro` |
-| `NVIDIA_REQUEST_TIMEOUT_MS` | `120000` | Timeout máximo por requisição (ms) |
-| `PLAYWRIGHT_USER_DATA_DIR` | `./playwright-profile` | Pasta do perfil do Chromium |
-| `PLAYWRIGHT_CHROME` | (auto-detecção) | Caminho do executável do Chrome/Edge |
-
-## Integração com pi.dev
-
-Adicione o provider no `~/.pi/agent/models.json`:
-
-```json
-{
-  "providers": {
-    "nvidia-kimi": {
-      "baseUrl": "http://localhost:4874/v1",
-      "api": "openai-completions",
-      "apiKey": "dummy",
-      "compat": {
-        "supportsDeveloperRole": false,
-        "supportsReasoningEffort": false,
-        "supportsUsageInStreaming": false
-      },
-      "models": [
-        {
-          "id": "nvidia-kimi-k2.6",
-          "name": "NVIDIA Kimi K2.6",
-          "reasoning": false,
-          "input": ["text"],
-          "contextWindow": 128000,
-          "maxTokens": 131072,
-          "cost": {
-            "input": 0,
-            "output": 0,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          }
-        }
-      ]
-    }
-  }
-}
-```
-
-E defina como padrão no `~/.pi/agent/settings.json`:
-
-```json
-{
-  "defaultProvider": "nvidia-kimi",
-  "defaultModel": "nvidia-kimi-k2.6"
-}
-```
-
-## Como funciona
-
-1. O Playwright abre uma janela do Chromium com um perfil persistente
-2. O proxy escuta requisições no formato OpenAI `/v1/chat/completions`
-3. Ao receber uma requisição, insere o payload no textarea do playground e clica em Enviar
-4. Intercepta a requisição de predição e substitui o body pelos dados do cliente
-5. A resposta SSE é convertida de volta para o formato OpenAI
-6. Modelos com suporte a reasoning expõem `reasoning_content` quando a NVIDIA envia esse campo
-7. Para DeepSeek V4 Pro, `reasoning_effort=max` é enviado por padrão e `chat_template_kwargs.thinking` não é injetado
 
 ## Docker
 
-O container instala Chromium via `apt`, roda em `HEADLESS=true` e salva o perfil persistente em `/app/profile`.
+O container instala Chromium via `apt`, roda com `HEADLESS=true` e salva o perfil persistente em `/app/profile`.
 
-> A primeira subida em profile limpo foi validada em headless. O proxy tenta aceitar automaticamente os termos/cookies do playground e reutiliza o perfil salvo no volume.
-
-### Construir e executar
+Build:
 
 ```bash
-# Construir a imagem
 docker build -t nvidia-kimi-proxy .
+```
 
-# Executar o container
+Run:
+
+```bash
 docker run -d \
   --name nvidia-kimi-proxy \
   -p 4874:4874 \
-  -e API_KEY="sua-chave-local" \
+  -e API_KEY="dummy" \
   -v nvidia-kimi-profile:/app/profile \
   --restart unless-stopped \
   nvidia-kimi-proxy
 ```
 
-Se quiser reaproveitar variáveis do `.env`, passe-as explicitamente com `--env-file`, mas sobrescreva o perfil para o caminho Linux do container:
+Com `.env`:
 
 ```bash
 docker run -d \
@@ -254,13 +146,13 @@ docker run -d \
   nvidia-kimi-proxy
 ```
 
-### Docker Compose
+Docker Compose:
 
 ```bash
 docker compose up -d
 ```
 
-Por padrão o compose publica `localhost:4874`. Para outra porta no host:
+Outra porta no host:
 
 ```bash
 HOST_PORT=4875 docker compose up -d
@@ -273,27 +165,282 @@ set HOST_PORT=4875
 docker compose up -d
 ```
 
-### Notas sobre Docker
+## EasyPanel
 
-- Na **primeira execução**, o proxy aceita automaticamente os termos da NVIDIA via `dismissCookieBanner`. O perfil é salvo no volume `nvidia-kimi-profile` e reutilizado nas próximas execuções.
-- O container usa o Chromium instalado via apt (`/usr/bin/chromium`).
-- `PLAYWRIGHT_CHROME`, `PLAYWRIGHT_USER_DATA_DIR` e `PLAYWRIGHT_CHROMIUM_ARGS` já vêm configurados no `Dockerfile` e no `docker-compose.yml`.
-- Use `HOST_PORT` para mudar a porta publicada pelo compose. Mantenha `PORT=4874` dentro do container salvo se souber que precisa alterar.
-- O healthcheck chama `GET /`, que não exige `API_KEY`.
+Deploy validado via Dockerfile a partir do GitHub.
 
-## Estrutura de Arquivos
+Variáveis recomendadas:
 
+```env
+PORT=4874
+HOST_PORT=4874
+API_KEY=dummy
+HEADLESS=true
+NVIDIA_THINKING=false
+NVIDIA_MAX_TOKENS=131072
+NVIDIA_TEMPERATURE=0.2
+NVIDIA_TOP_P=0.8
+NVIDIA_DEEPSEEK_REASONING_EFFORT=max
+NVIDIA_REQUEST_TIMEOUT_MS=120000
+PLAYWRIGHT_USER_DATA_DIR=/app/profile
+PLAYWRIGHT_CHROME=/usr/bin/chromium
+PLAYWRIGHT_CHROMIUM_ARGS=--no-sandbox --disable-dev-shm-usage
 ```
+
+Configure volume persistente em:
+
+```txt
+/app/profile
+```
+
+Endpoint de exemplo em produção:
+
+```txt
+https://evo-kimi.ebmtg1.easypanel.host/v1/chat/completions
+```
+
+O deploy em EasyPanel foi validado com:
+
+- `GET /`
+- `GET /debug/status`
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- Os 3 modelos listados acima
+
+## API
+
+Base local:
+
+```txt
+http://localhost:4874/v1
+```
+
+Health check sem autenticação:
+
+```bash
+curl http://localhost:4874/
+```
+
+Listar modelos:
+
+```bash
+curl http://localhost:4874/v1/models \
+  -H "Authorization: Bearer dummy"
+```
+
+Chat non-stream:
+
+```bash
+curl http://localhost:4874/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy" \
+  -d '{
+    "model": "moonshotai/kimi-k2.6",
+    "messages": [{"role": "user", "content": "Responda apenas: ok"}],
+    "max_tokens": 128
+  }'
+```
+
+Chat streaming:
+
+```bash
+curl -N http://localhost:4874/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy" \
+  -d '{
+    "model": "deepseek-ai/deepseek-v4-pro",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Responda apenas: ok"}],
+    "max_tokens": 512
+  }'
+```
+
+Tool calling:
+
+```bash
+curl http://localhost:4874/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer dummy" \
+  -d '{
+    "model": "deepseek-ai/deepseek-v4-pro",
+    "messages": [{"role": "user", "content": "Use a ferramenta get_weather para consultar o clima de Paris."}],
+    "tools": [
+      {
+        "type": "function",
+        "function": {
+          "name": "get_weather",
+          "description": "Consulta o clima de uma cidade",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "city": { "type": "string" }
+            },
+            "required": ["city"]
+          }
+        }
+      }
+    ],
+    "tool_choice": {"type": "function", "function": {"name": "get_weather"}},
+    "max_tokens": 512
+  }'
+```
+
+## Reasoning
+
+Quando a NVIDIA retorna thinking/reasoning, o proxy preserva o campo OpenAI-style:
+
+Resposta non-stream:
+
+```json
+{
+  "message": {
+    "role": "assistant",
+    "content": "ok",
+    "reasoning_content": "..."
+  }
+}
+```
+
+Resposta stream:
+
+```txt
+data: {"choices":[{"delta":{"reasoning_content":"..."}}]}
+data: {"choices":[{"delta":{"content":"ok"}}]}
+```
+
+No DeepSeek V4 Pro, o payload enviado inclui por padrão:
+
+```json
+{
+  "reasoning_effort": "max"
+}
+```
+
+Você pode sobrescrever por request:
+
+```json
+{
+  "model": "deepseek-ai/deepseek-v4-pro",
+  "reasoning_effort": "max",
+  "messages": []
+}
+```
+
+## Debug
+
+Endpoints protegidos por `API_KEY` quando configurada:
+
+```bash
+curl http://localhost:4874/debug/status \
+  -H "Authorization: Bearer dummy"
+```
+
+```bash
+curl http://localhost:4874/debug/page \
+  -H "Authorization: Bearer dummy"
+```
+
+`/debug/status` mostra `browserReady`, URL atual, perfil usado, modo headless e último rewrite.
+
+`/debug/page` mostra estado do playground: textarea, botão Send, modais visíveis e snapshot textual.
+
+## Comportamento Validado
+
+Validado localmente e em EasyPanel/Docker:
+
+- Headless com profile limpo
+- Aceite automático de cookies e modal “Acknowledge & Continue”
+- Navegação entre os 3 playgrounds
+- Chat non-stream nos 3 modelos
+- Chat streaming nos 3 modelos
+- Tool calling non-stream nos 3 modelos
+- Tool calling stream nos 3 modelos
+- `reasoning_content` no DeepSeek V4 Pro e StepFun quando retornado pela NVIDIA
+- API key via `Authorization: Bearer ...`
+
+## Como Funciona
+
+1. O servidor recebe chamadas OpenAI-compatible em `/v1/chat/completions`.
+2. O Playwright mantém um Chromium persistente com perfil salvo.
+3. Para cada modelo, o proxy abre o playground NVIDIA correspondente.
+4. O proxy preenche o textarea e clica em Send para gerar uma requisição real do browser.
+5. A rota `https://api.ngc.nvidia.com/v2/predict/models/**` é interceptada.
+6. O body original é substituído pelo payload OpenAI-compatible convertido.
+7. A resposta SSE da NVIDIA é convertida para resposta OpenAI-compatible.
+8. Tool calls, streaming, usage e `reasoning_content` são preservados quando presentes.
+
+## Integração pi.dev
+
+Exemplo de provider em `~/.pi/agent/models.json`:
+
+```json
+{
+  "providers": {
+    "nvidia-playground": {
+      "baseUrl": "http://localhost:4874/v1",
+      "api": "openai-completions",
+      "apiKey": "dummy",
+      "compat": {
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": true,
+        "supportsUsageInStreaming": true
+      },
+      "models": [
+        {
+          "id": "moonshotai/kimi-k2.6",
+          "name": "NVIDIA Kimi K2.6",
+          "reasoning": false,
+          "input": ["text"],
+          "contextWindow": 128000,
+          "maxTokens": 131072,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "deepseek-ai/deepseek-v4-pro",
+          "name": "NVIDIA DeepSeek V4 Pro",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 1000000,
+          "maxTokens": 131072,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        },
+        {
+          "id": "stepfun-ai/step-3.7-flash",
+          "name": "NVIDIA StepFun Step 3.7 Flash",
+          "reasoning": true,
+          "input": ["text"],
+          "contextWindow": 128000,
+          "maxTokens": 131072,
+          "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 }
+        }
+      ]
+    }
+  }
+}
+```
+
+## Estrutura
+
+```txt
 nvidia-kimi-proxy/
-├── playwright-proxy.mjs        # Proxy principal (Node.js + Playwright)
-├── package.json                # Dependências npm
-├── Dockerfile                  # Imagem Node + Chromium
-├── docker-compose.yml          # Serviço Docker com volume persistente
+├── playwright-proxy.mjs              # Proxy principal Node.js + Playwright
+├── package.json                      # Dependências npm
+├── package-lock.json
+├── Dockerfile                        # Imagem Node + Chromium
+├── docker-compose.yml                # Compose com volume persistente
 ├── .dockerignore
-├── .env.example                # Exemplo de configuração
+├── .env.example                      # Exemplo de variáveis
 ├── .gitignore
 ├── README.md
-├── playwright-profile/         # Perfil do Chromium (criado na primeira execução)
-├── run-playwright-proxy.bat    # Atalho para modo visível
-└── run-playwright-proxy-headless.bat  # Atalho para modo headless
+├── cmd/                              # Caminho Go legado/auxiliar
+├── internal/                         # Utilitários Go legados/auxiliares
+├── run-playwright-proxy.bat          # Atalho Windows visível
+└── run-playwright-proxy-headless.bat # Atalho Windows headless
 ```
+
+## Notas
+
+- Não commite `.env` nem perfis Chromium. Eles ficam ignorados por `.gitignore`.
+- O healthcheck usa `GET /`, que não exige `API_KEY`.
+- Em Windows, `curl` pode falhar em HTTPS público com `CRYPT_E_NO_REVOCATION_CHECK`; para teste local do deploy foi usado `curl -k`.
+- O Dockerfile foi feito para Linux container com `/usr/bin/chromium`.
