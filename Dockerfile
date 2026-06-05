@@ -5,7 +5,8 @@ ENV NODE_ENV=production \
     HEADLESS=true \
     PLAYWRIGHT_CHROME=/usr/bin/chromium \
     PLAYWRIGHT_USER_DATA_DIR=/app/profile \
-    PLAYWRIGHT_CHROMIUM_ARGS="--no-sandbox --disable-dev-shm-usage"
+    PLAYWRIGHT_CHROMIUM_ARGS="--no-sandbox --disable-dev-shm-usage --single-process" \
+    PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS=60000
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \

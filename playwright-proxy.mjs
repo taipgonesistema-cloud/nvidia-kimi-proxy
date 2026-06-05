@@ -33,6 +33,7 @@ const DEFAULT_TEMPERATURE = Number(process.env.NVIDIA_TEMPERATURE || 0.2);
 const DEFAULT_TOP_P = Number(process.env.NVIDIA_TOP_P || 0.8);
 const API_KEY = process.env.API_KEY || "";
 const DEFAULT_DEEPSEEK_REASONING_EFFORT = process.env.NVIDIA_DEEPSEEK_REASONING_EFFORT || "max";
+const BROWSER_IDLE_TIMEOUT_MS = Number(process.env.PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS || 300000);
 
 let context = null;
 let page = null;
@@ -41,6 +42,7 @@ let lock = Promise.resolve();
 let lastRewrite = null;
 let browserInitPromise = null;
 let routeInstalled = false;
+let browserIdleTimer = null;
 
 function parseBool(value, fallback = false) {
   if (value === undefined || value === null || value === "") return fallback;
@@ -79,11 +81,50 @@ function findBrowserExecutable() {
 }
 
 function chromiumArgs() {
+  const defaultArgs = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-background-networking",
+    "--disable-background-timer-throttling",
+    "--disable-client-side-phishing-detection",
+    "--disable-default-apps",
+    "--disable-extensions",
+    "--disable-features=Translate,OptimizationHints,MediaRouter,AutofillServerCommunication,InterestFeedContentSuggestions",
+    "--disable-hang-monitor",
+    "--disable-ipc-flooding-protection",
+    "--disable-notifications",
+    "--disable-popup-blocking",
+    "--disable-prompt-on-repost",
+    "--disable-renderer-backgrounding",
+    "--disable-sync",
+    "--metrics-recording-only",
+    "--mute-audio",
+    "--no-default-browser-check",
+    "--no-first-run",
+  ];
   const extraArgs = String(process.env.PLAYWRIGHT_CHROMIUM_ARGS || "")
     .split(/\s+/)
     .map((arg) => arg.trim())
     .filter(Boolean);
-  return ["--disable-blink-features=AutomationControlled", ...extraArgs];
+  return [...new Set([...defaultArgs, ...extraArgs])];
+}
+
+function scheduleBrowserIdleClose() {
+  if (browserIdleTimer) clearTimeout(browserIdleTimer);
+  if (!BROWSER_IDLE_TIMEOUT_MS) return;
+  browserIdleTimer = setTimeout(async () => {
+    if (currentPending) return scheduleBrowserIdleClose();
+    await context?.close().catch(() => {});
+    context = null;
+    page = null;
+    routeInstalled = false;
+  }, BROWSER_IDLE_TIMEOUT_MS);
+}
+
+function keepBrowserAwake() {
+  if (browserIdleTimer) {
+    clearTimeout(browserIdleTimer);
+    browserIdleTimer = null;
+  }
 }
 
 function withLock(fn) {
@@ -360,7 +401,11 @@ function sendOpenAIStream(res, response) {
 }
 
 async function ensureBrowser(modelInfo = MODELS[DEFAULT_MODEL]) {
-  if (context && page && !page.isClosed() && page.url().startsWith(modelInfo.playgroundURL)) return;
+  keepBrowserAwake();
+  if (context && page && !page.isClosed() && page.url().startsWith(modelInfo.playgroundURL)) {
+    scheduleBrowserIdleClose();
+    return;
+  }
   if (browserInitPromise) return browserInitPromise;
 
   browserInitPromise = (async () => {
@@ -378,7 +423,7 @@ async function ensureBrowser(modelInfo = MODELS[DEFAULT_MODEL]) {
     context = await chromium.launchPersistentContext(USER_DATA_DIR, {
       executablePath,
       headless: HEADLESS,
-      viewport: { width: 1365, height: 900 },
+      viewport: { width: 1024, height: 768 },
       args: chromiumArgs(),
     });
 
@@ -386,10 +431,11 @@ async function ensureBrowser(modelInfo = MODELS[DEFAULT_MODEL]) {
     page.setDefaultTimeout(30000);
     routeInstalled = false;
     if (!routeInstalled) {
-      await context.route(PREDICT_ROUTE, handleRoute);
+      await context.route("**/*", handleRoute);
       routeInstalled = true;
     }
     await openPlayground(modelInfo, false);
+    scheduleBrowserIdleClose();
   })();
 
   try {
@@ -449,6 +495,25 @@ async function preparePlayground(modelInfo) {
 
 async function handleRoute(route) {
   const request = route.request();
+  const url = new URL(request.url());
+  const host = url.hostname;
+  const resourceType = request.resourceType();
+
+  if (!request.url().includes("/v2/predict/models/")) {
+    if (["image", "media", "font"].includes(resourceType)
+      || host.includes("google-analytics")
+      || host.includes("googletagmanager")
+      || host.includes("doubleclick")
+      || host.includes("linkedin")
+      || host.includes("nr-data")
+      || host.includes("newrelic")) {
+      await route.abort().catch(() => {});
+      return;
+    }
+    await route.continue();
+    return;
+  }
+
   if (request.method() !== "POST" || !request.url().includes("/v2/predict/models/")) {
     await route.continue();
     return;
@@ -765,6 +830,7 @@ async function predict(postData, modelInfo) {
       return response.body;
     } finally {
       currentPending = null;
+      scheduleBrowserIdleClose();
     }
   });
 }

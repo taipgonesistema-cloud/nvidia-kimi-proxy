@@ -17,7 +17,8 @@ services:
       NVIDIA_REQUEST_TIMEOUT_MS: "${NVIDIA_REQUEST_TIMEOUT_MS:-120000}"
       PLAYWRIGHT_CHROME: "/usr/bin/chromium"
       PLAYWRIGHT_USER_DATA_DIR: "/app/profile"
-      PLAYWRIGHT_CHROMIUM_ARGS: "--no-sandbox --disable-dev-shm-usage"
+      PLAYWRIGHT_CHROMIUM_ARGS: "--no-sandbox --disable-dev-shm-usage --single-process"
+      PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS: "${PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS:-60000}"
     volumes:
       - nvidia-kimi-profile:/app/profile
 

@@ -50,6 +50,8 @@ NVIDIA_DEEPSEEK_REASONING_EFFORT=max
 NVIDIA_REQUEST_TIMEOUT_MS=120000
 PLAYWRIGHT_USER_DATA_DIR=
 PLAYWRIGHT_CHROME=
+PLAYWRIGHT_CHROMIUM_ARGS=
+PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS=60000
 ```
 
 Variáveis principais:
@@ -69,6 +71,7 @@ Variáveis principais:
 | `PLAYWRIGHT_USER_DATA_DIR` | `./playwright-profile` | Diretório persistente do Chromium |
 | `PLAYWRIGHT_CHROME` | auto-detecção | Caminho do Chrome/Edge/Chromium |
 | `PLAYWRIGHT_CHROMIUM_ARGS` | vazio local | Flags extras do Chromium. No Docker use `--no-sandbox --disable-dev-shm-usage` |
+| `PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS` | `60000` no Docker, `300000` local | Fecha o Chromium após esse tempo ocioso para reduzir CPU/RAM. Use `0` para manter sempre aberto |
 
 ## Execução Local
 
@@ -184,7 +187,8 @@ NVIDIA_DEEPSEEK_REASONING_EFFORT=max
 NVIDIA_REQUEST_TIMEOUT_MS=120000
 PLAYWRIGHT_USER_DATA_DIR=/app/profile
 PLAYWRIGHT_CHROME=/usr/bin/chromium
-PLAYWRIGHT_CHROMIUM_ARGS=--no-sandbox --disable-dev-shm-usage
+PLAYWRIGHT_CHROMIUM_ARGS=--no-sandbox --disable-dev-shm-usage --single-process
+PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS=60000
 ```
 
 Configure volume persistente em:
@@ -444,3 +448,28 @@ nvidia-kimi-proxy/
 - O healthcheck usa `GET /`, que não exige `API_KEY`.
 - Em Windows, `curl` pode falhar em HTTPS público com `CRYPT_E_NO_REVOCATION_CHECK`; para teste local do deploy foi usado `curl -k`.
 - O Dockerfile foi feito para Linux container com `/usr/bin/chromium`.
+
+## CPU/RAM
+
+Para VPS pequena, o proxy aplica algumas economias por padrão:
+
+- Bloqueia imagens, fontes, mídia e trackers conhecidos no Chromium.
+- Usa viewport menor (`1024x768`).
+- Desativa recursos de background do Chromium via flags.
+- Fecha o browser após `PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS` sem requisições.
+
+Configuração recomendada no Docker/EasyPanel:
+
+```env
+HEADLESS=true
+PLAYWRIGHT_CHROMIUM_ARGS=--no-sandbox --disable-dev-shm-usage --single-process
+PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS=60000
+```
+
+Se quiser zerar CPU quando não estiver usando, reduza o idle timeout:
+
+```env
+PLAYWRIGHT_BROWSER_IDLE_TIMEOUT_MS=60000
+```
+
+Trade-off: quando o Chromium fecha por idle, a próxima requisição demora mais porque precisa abrir o navegador e carregar o playground novamente.
